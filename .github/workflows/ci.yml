@@ -4,15 +4,25 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  workspace:
     runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      LLVM_SYS_221_PREFIX: /opt/homebrew/opt/llvm
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy, llvm-tools-preview
+      - name: Install LLVM
+        run: brew install llvm
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Check formatting
@@ -27,3 +37,30 @@ jobs:
         run: python3 scripts/coverage_summary.py coverage-summary.json
       - name: Coverage lcov
         run: cargo llvm-cov report --lcov --output-path coverage.lcov
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage-summary.json
+            coverage.lcov
+
+  ipopt:
+    runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      LLVM_SYS_221_PREFIX: /opt/homebrew/opt/llvm
+      PKG_CONFIG_PATH: /opt/homebrew/opt/ipopt/lib/pkgconfig
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - name: Install LLVM and IPOPT
+        run: brew install llvm ipopt
+      - name: Run IPOPT optimization tests
+        run: cargo test -p optimization --features ipopt
+      - name: Run IPOPT clippy
+        run: cargo clippy -p optimization --all-targets --features ipopt -- -D warnings

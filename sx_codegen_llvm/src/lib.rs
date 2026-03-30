@@ -54,6 +54,10 @@ use sx_core::{BinaryOp, SXFunction, UnaryOp};
 
 type RawKernelFn = unsafe extern "C" fn(*const *const f64, *const *mut f64);
 
+fn kernel_symbol_name(name: &str) -> String {
+    format!("__sx_codegen_llvm_{}", sanitize_ident(name))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlvmOptimizationLevel {
     O0,
@@ -156,7 +160,7 @@ impl CompiledJitFunction {
             return Err(error.context("failed to add object file to LLJIT"));
         }
 
-        let address = lookup_symbol_address(lljit, &lowered.name)?;
+        let address = lookup_symbol_address(lljit, &kernel_symbol_name(&lowered.name))?;
         let addr = usize::try_from(address)
             .map_err(|_| anyhow!("JIT symbol address does not fit into usize"))?;
         let function = unsafe { mem::transmute::<usize, RawKernelFn>(addr) };
@@ -374,7 +378,7 @@ unsafe fn build_module(
     triple: &CString,
 ) -> Result<LLVMModuleRef> {
     let module_name = CString::new(format!("{}_llvm_jit", lowered.name))?;
-    let symbol_name = CString::new(lowered.name.clone())?;
+    let symbol_name = CString::new(kernel_symbol_name(&lowered.name))?;
     let module = unsafe { LLVMModuleCreateWithNameInContext(module_name.as_ptr(), context) };
     unsafe { LLVMSetTarget(module, triple.as_ptr()) };
 
@@ -793,7 +797,7 @@ pub fn generate_aot_wrapper_module(
     out.push_str("    unsafe extern \"C\" {\n");
     out.push_str(&format!(
         "        fn {}(inputs: *const *const f64, outputs: *const *mut f64);\n",
-        lowered.name
+        kernel_symbol_name(&lowered.name)
     ));
     out.push_str("    }\n");
 
@@ -871,7 +875,7 @@ pub fn generate_aot_wrapper_module(
     ));
     out.push_str(&format!(
         "        unsafe {{ {}(input_ptrs.as_ptr(), output_ptrs.as_mut_ptr()); }}\n",
-        lowered.name
+        kernel_symbol_name(&lowered.name)
     ));
     for assignment in scalar_output_assignments {
         out.push_str(&assignment);
@@ -1236,7 +1240,7 @@ mod tests {
 
         assert!(wrapper.contains("pub mod llvm_aot_wrapper_llvm_aot"));
         assert!(wrapper.contains("unsafe extern \"C\""));
-        assert!(wrapper.contains("fn llvm_aot_wrapper"));
+        assert!(wrapper.contains("fn __sx_codegen_llvm_llvm_aot_wrapper"));
         assert!(wrapper.contains("pub struct LlvmAotWrapperLlvmAotContext"));
     }
 

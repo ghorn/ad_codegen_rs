@@ -16,6 +16,91 @@ use generated_problem::{
     parameterized_quadratic_parameter_ccs, parameterized_quadratic_problem, simple_nlp_problem,
 };
 
+struct BoundConstrainedQuadraticProblem;
+
+impl CompiledNlpProblem for BoundConstrainedQuadraticProblem {
+    fn dimension(&self) -> usize {
+        2
+    }
+
+    fn parameter_count(&self) -> usize {
+        0
+    }
+
+    fn parameter_ccs(&self, _parameter_index: usize) -> &CCS {
+        unreachable!("bound constrained quadratic problem has no parameters")
+    }
+
+    fn variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) -> bool {
+        lower.copy_from_slice(&[2.0, f64::NEG_INFINITY]);
+        upper.copy_from_slice(&[f64::INFINITY, -3.0]);
+        true
+    }
+
+    fn equality_count(&self) -> usize {
+        0
+    }
+
+    fn inequality_count(&self) -> usize {
+        0
+    }
+
+    fn objective_value(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>]) -> f64 {
+        (x[0] + 10.0).powi(2) + (x[1] - 10.0).powi(2)
+    }
+
+    fn objective_gradient(&self, x: &[f64], _parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        out.copy_from_slice(&[2.0 * (x[0] + 10.0), 2.0 * (x[1] - 10.0)]);
+    }
+
+    fn equality_jacobian_ccs(&self) -> &CCS {
+        static EMPTY: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| CCS::empty(0, 2))
+    }
+
+    fn equality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {}
+
+    fn equality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn inequality_jacobian_ccs(&self) -> &CCS {
+        static EMPTY: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| CCS::empty(0, 2))
+    }
+
+    fn inequality_values(&self, _x: &[f64], _parameters: &[ParameterMatrix<'_>], _out: &mut [f64]) {
+    }
+
+    fn inequality_jacobian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _out: &mut [f64],
+    ) {
+    }
+
+    fn lagrangian_hessian_ccs(&self) -> &CCS {
+        static HESSIAN_CCS: std::sync::OnceLock<CCS> = std::sync::OnceLock::new();
+        HESSIAN_CCS.get_or_init(|| CCS::lower_triangular_dense(2))
+    }
+
+    fn lagrangian_hessian_values(
+        &self,
+        _x: &[f64],
+        _parameters: &[ParameterMatrix<'_>],
+        _equality_multipliers: &[f64],
+        _inequality_multipliers: &[f64],
+        out: &mut [f64],
+    ) {
+        out.copy_from_slice(&[2.0, 0.0, 2.0]);
+    }
+}
+
 fn verbose_sqp_requested() -> bool {
     std::env::var_os("AD_CODEGEN_SQP_VERBOSE").is_some()
 }
@@ -310,4 +395,26 @@ fn sqp_reports_profiling_breakdown(
             assert!(profiling.backend_timing.jit_time.is_some());
         }
     }
+}
+
+#[test]
+fn sqp_enforces_box_bounds_regression() {
+    let problem = BoundConstrainedQuadraticProblem;
+    let summary = solve_ok(
+        &problem,
+        &[0.0, 0.0],
+        &[],
+        ClarabelSqpOptions {
+            max_iters: 40,
+            merit_penalty: 50.0,
+            ..ClarabelSqpOptions::default()
+        },
+    );
+
+    assert_abs_diff_eq!(summary.x[0], 2.0, epsilon = 1e-8);
+    assert_abs_diff_eq!(summary.x[1], -3.0, epsilon = 1e-8);
+    assert_abs_diff_eq!(summary.objective, 313.0, epsilon = 1e-6);
+    assert!(summary.primal_inf_norm <= 1e-8);
+    assert!(summary.dual_inf_norm <= 1e-7);
+    assert!(summary.complementarity_inf_norm <= 1e-7);
 }

@@ -6,61 +6,12 @@ use approx::assert_abs_diff_eq;
 use proptest::prelude::*;
 use rstest::rstest;
 use serde::Deserialize;
-use sx_core::{
-    BinaryOp, CCS, HessianStrategy, NamedMatrix, NodeView, SX, SXFunction, SXMatrix, UnaryOp,
-};
+use sx_core::{CCS, HessianStrategy, NamedMatrix, SX, SXFunction, SXMatrix};
 
-fn eval(expr: SX, vars: &HashMap<u32, f64>) -> f64 {
-    match expr.inspect() {
-        NodeView::Constant(v) => v,
-        NodeView::Symbol { .. } => vars[&expr.id()],
-        NodeView::Unary { op, arg } => {
-            let arg = eval(arg, vars);
-            match op {
-                UnaryOp::Abs => arg.abs(),
-                UnaryOp::Sign => {
-                    if arg > 0.0 {
-                        1.0
-                    } else if arg < 0.0 {
-                        -1.0
-                    } else {
-                        0.0
-                    }
-                }
-                UnaryOp::Floor => arg.floor(),
-                UnaryOp::Ceil => arg.ceil(),
-                UnaryOp::Round => arg.round(),
-                UnaryOp::Trunc => arg.trunc(),
-                UnaryOp::Sqrt => arg.sqrt(),
-                UnaryOp::Exp => arg.exp(),
-                UnaryOp::Log => arg.ln(),
-                UnaryOp::Sin => arg.sin(),
-                UnaryOp::Cos => arg.cos(),
-                UnaryOp::Tan => arg.tan(),
-                UnaryOp::Asin => arg.asin(),
-                UnaryOp::Acos => arg.acos(),
-                UnaryOp::Atan => arg.atan(),
-                UnaryOp::Sinh => arg.sinh(),
-                UnaryOp::Cosh => arg.cosh(),
-                UnaryOp::Tanh => arg.tanh(),
-                UnaryOp::Asinh => arg.asinh(),
-                UnaryOp::Acosh => arg.acosh(),
-                UnaryOp::Atanh => arg.atanh(),
-            }
-        }
-        NodeView::Binary { op, lhs, rhs } => match op {
-            BinaryOp::Add => eval(lhs, vars) + eval(rhs, vars),
-            BinaryOp::Sub => eval(lhs, vars) - eval(rhs, vars),
-            BinaryOp::Mul => eval(lhs, vars) * eval(rhs, vars),
-            BinaryOp::Div => eval(lhs, vars) / eval(rhs, vars),
-            BinaryOp::Pow => eval(lhs, vars).powf(eval(rhs, vars)),
-            BinaryOp::Atan2 => eval(lhs, vars).atan2(eval(rhs, vars)),
-            BinaryOp::Hypot => eval(lhs, vars).hypot(eval(rhs, vars)),
-            BinaryOp::Mod => eval(lhs, vars) % eval(rhs, vars),
-            BinaryOp::Copysign => eval(lhs, vars).copysign(eval(rhs, vars)),
-        },
-    }
-}
+#[path = "../../test_support/symbolic_eval.rs"]
+mod symbolic_eval;
+
+use symbolic_eval::eval;
 
 fn assert_matrix_values_match(lhs: &SXMatrix, rhs: &SXMatrix, vars: &HashMap<u32, f64>) {
     assert_eq!(lhs.shape(), rhs.shape());
@@ -244,7 +195,7 @@ fn extended_binary_ops_match_numeric_reference() {
         (a.hypot(b), a / a.hypot(b), b / a.hypot(b))
     });
     assert_binary_matches(x % y, x, y, (1.7, 0.8), |a, b| {
-        (a % b, 1.0, -(a / b).floor())
+        (a % b, 1.0, -(a / b).trunc())
     });
     assert_binary_matches(x.max(y), x, y, (1.7, 0.8), |a, b| {
         (

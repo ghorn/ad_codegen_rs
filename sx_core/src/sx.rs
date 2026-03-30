@@ -756,10 +756,10 @@ fn binary_partials(op: BinaryOp, lhs: SX, rhs: SX) -> (SX, SX) {
             let hypot = lhs.hypot(rhs);
             (lhs / hypot, rhs / hypot)
         }
-        BinaryOp::Mod => (SX::one(), -(lhs / rhs).floor()),
+        BinaryOp::Mod => (SX::one(), -(lhs / rhs).trunc()),
         BinaryOp::Copysign => {
-            let rhs_sign = rhs.sign();
-            (rhs_sign + (SX::one() - rhs_sign.abs()), SX::zero())
+            let rhs_sign = rhs.sign() + (SX::one() - rhs.sign().abs());
+            (lhs.sign() * rhs_sign, SX::zero())
         }
     }
 }

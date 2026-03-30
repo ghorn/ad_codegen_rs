@@ -5,63 +5,12 @@ use approx::assert_abs_diff_eq;
 use rstest::rstest;
 use sx_codegen::lower_function;
 use sx_codegen_llvm::{CompiledJitFunction, JitOptimizationLevel};
-use sx_core::{BinaryOp, CCS, NamedMatrix, NodeView, SX, SXFunction, SXMatrix, SxError, UnaryOp};
+use sx_core::{CCS, NamedMatrix, NodeView, SX, SXFunction, SXMatrix, SxError};
 
-fn eval(expr: SX, vars: &HashMap<u32, f64>) -> f64 {
-    match expr.inspect() {
-        NodeView::Constant(value) => value,
-        NodeView::Symbol { .. } => vars[&expr.id()],
-        NodeView::Unary { op, arg } => {
-            let arg = eval(arg, vars);
-            match op {
-                UnaryOp::Abs => arg.abs(),
-                UnaryOp::Sign => {
-                    if arg > 0.0 {
-                        1.0
-                    } else if arg < 0.0 {
-                        -1.0
-                    } else {
-                        0.0
-                    }
-                }
-                UnaryOp::Floor => arg.floor(),
-                UnaryOp::Ceil => arg.ceil(),
-                UnaryOp::Round => arg.round(),
-                UnaryOp::Trunc => arg.trunc(),
-                UnaryOp::Sqrt => arg.sqrt(),
-                UnaryOp::Exp => arg.exp(),
-                UnaryOp::Log => arg.ln(),
-                UnaryOp::Sin => arg.sin(),
-                UnaryOp::Cos => arg.cos(),
-                UnaryOp::Tan => arg.tan(),
-                UnaryOp::Asin => arg.asin(),
-                UnaryOp::Acos => arg.acos(),
-                UnaryOp::Atan => arg.atan(),
-                UnaryOp::Sinh => arg.sinh(),
-                UnaryOp::Cosh => arg.cosh(),
-                UnaryOp::Tanh => arg.tanh(),
-                UnaryOp::Asinh => arg.asinh(),
-                UnaryOp::Acosh => arg.acosh(),
-                UnaryOp::Atanh => arg.atanh(),
-            }
-        }
-        NodeView::Binary { op, lhs, rhs } => {
-            let lhs = eval(lhs, vars);
-            let rhs = eval(rhs, vars);
-            match op {
-                BinaryOp::Add => lhs + rhs,
-                BinaryOp::Sub => lhs - rhs,
-                BinaryOp::Mul => lhs * rhs,
-                BinaryOp::Div => lhs / rhs,
-                BinaryOp::Pow => lhs.powf(rhs),
-                BinaryOp::Atan2 => lhs.atan2(rhs),
-                BinaryOp::Hypot => lhs.hypot(rhs),
-                BinaryOp::Mod => lhs % rhs,
-                BinaryOp::Copysign => lhs.copysign(rhs),
-            }
-        }
-    }
-}
+#[path = "../../test_support/symbolic_eval.rs"]
+mod symbolic_eval;
+
+use symbolic_eval::eval;
 
 fn eval_matrix(matrix: &SXMatrix, vars: &HashMap<u32, f64>) -> Vec<Vec<f64>> {
     let (nrow, ncol) = matrix.shape();
@@ -1749,8 +1698,8 @@ fn sx_copysign_matches_casadi_test_copysign_via_adaptor() {
     for ((x_value, y_value), expected) in [
         ((2.0, 0.5), 1.0),
         ((2.0, -0.5), -1.0),
-        ((-2.0, 0.5), 1.0),
-        ((-2.0, -0.5), -1.0),
+        ((-2.0, 0.5), -1.0),
+        ((-2.0, -0.5), 1.0),
         ((2.0, 0.0), 1.0),
     ] {
         let vars = HashMap::from([(x.id(), x_value), (y.id(), y_value)]);

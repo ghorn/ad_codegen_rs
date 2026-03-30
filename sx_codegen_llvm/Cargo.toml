@@ -15,5 +15,6 @@ sx_codegen = { path = "../sx_codegen" }
 sx_core = { path = "../sx_core" }
 
 [dev-dependencies]
+proptest.workspace = true
 rstest.workspace = true
 sx_core = { path = "../sx_core" }

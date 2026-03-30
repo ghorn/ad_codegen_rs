@@ -234,6 +234,8 @@ pub struct ClarabelSqpSummary {
     pub x: Vec<f64>,
     pub equality_multipliers: Vec<f64>,
     pub inequality_multipliers: Vec<f64>,
+    pub lower_bound_multipliers: Vec<f64>,
+    pub upper_bound_multipliers: Vec<f64>,
     pub objective: f64,
     pub iterations: Index,
     pub equality_inf_norm: f64,
@@ -359,6 +361,98 @@ fn stack_jacobians(
         }
     }
     stacked
+}
+
+#[derive(Clone, Debug, Default)]
+struct BoundConstraints {
+    lower_indices: Vec<Index>,
+    lower_values: Vec<f64>,
+    upper_indices: Vec<Index>,
+    upper_values: Vec<f64>,
+}
+
+impl BoundConstraints {
+    fn total_count(&self) -> Index {
+        self.lower_indices.len() + self.upper_indices.len()
+    }
+}
+
+fn collect_bound_constraints<P>(
+    problem: &P,
+) -> std::result::Result<BoundConstraints, ClarabelSqpError>
+where
+    P: CompiledNlpProblem,
+{
+    let dimension = problem.dimension();
+    let mut lower = vec![0.0; dimension];
+    let mut upper = vec![0.0; dimension];
+    if !problem.variable_bounds(&mut lower, &mut upper) {
+        return Ok(BoundConstraints::default());
+    }
+
+    let mut bounds = BoundConstraints::default();
+    for idx in 0..dimension {
+        if lower[idx] > upper[idx] {
+            return Err(ClarabelSqpError::InvalidInput(format!(
+                "variable bound interval is empty at index {idx}: lower={} > upper={}",
+                lower[idx], upper[idx]
+            )));
+        }
+        if lower[idx] > -NLP_INF {
+            bounds.lower_indices.push(idx);
+            bounds.lower_values.push(lower[idx]);
+        }
+        if upper[idx] < NLP_INF {
+            bounds.upper_indices.push(idx);
+            bounds.upper_values.push(upper[idx]);
+        }
+    }
+    Ok(bounds)
+}
+
+fn build_bound_jacobian(bounds: &BoundConstraints, dimension: Index) -> DMatrix<f64> {
+    let mut jacobian = DMatrix::<f64>::zeros(bounds.total_count(), dimension);
+    for (row, &idx) in bounds.lower_indices.iter().enumerate() {
+        jacobian[(row, idx)] = -1.0;
+    }
+    let row_offset = bounds.lower_indices.len();
+    for (row, &idx) in bounds.upper_indices.iter().enumerate() {
+        jacobian[(row_offset + row, idx)] = 1.0;
+    }
+    jacobian
+}
+
+fn augment_inequality_values(
+    nonlinear_values: &[f64],
+    x: &[f64],
+    bounds: &BoundConstraints,
+    out: &mut [f64],
+) {
+    debug_assert_eq!(
+        out.len(),
+        nonlinear_values.len() + bounds.lower_indices.len() + bounds.upper_indices.len()
+    );
+    out[..nonlinear_values.len()].copy_from_slice(nonlinear_values);
+    let mut cursor = nonlinear_values.len();
+    for (&idx, &bound) in bounds.lower_indices.iter().zip(bounds.lower_values.iter()) {
+        out[cursor] = bound - x[idx];
+        cursor += 1;
+    }
+    for (&idx, &bound) in bounds.upper_indices.iter().zip(bounds.upper_values.iter()) {
+        out[cursor] = x[idx] - bound;
+        cursor += 1;
+    }
+}
+
+fn split_augmented_inequality_multipliers(
+    multipliers: &[f64],
+    nonlinear_count: Index,
+    lower_bound_count: Index,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let nonlinear = multipliers[..nonlinear_count].to_vec();
+    let lower = multipliers[nonlinear_count..nonlinear_count + lower_bound_count].to_vec();
+    let upper = multipliers[nonlinear_count + lower_bound_count..].to_vec();
+    (nonlinear, lower, upper)
 }
 
 fn inf_norm(values: &[f64]) -> f64 {
@@ -532,14 +626,15 @@ fn trial_merit<P>(
     problem: &P,
     x: &[f64],
     parameters: &[ParameterMatrix<'_>],
-    buffers: (&mut [f64], &mut [f64]),
+    buffers: (&mut [f64], &mut [f64], &mut [f64]),
+    bounds: &BoundConstraints,
     penalty: f64,
     timing: (&mut ClarabelSqpProfiling, &mut Duration),
 ) -> f64
 where
     P: CompiledNlpProblem,
 {
-    let (equality_values, inequality_values) = buffers;
+    let (equality_values, inequality_values, augmented_inequality_values) = buffers;
     let (profiling, iteration_callback_time) = timing;
     time_callback(
         &mut profiling.equality_values,
@@ -551,6 +646,7 @@ where
         iteration_callback_time,
         || problem.inequality_values(x, parameters, inequality_values),
     );
+    augment_inequality_values(inequality_values, x, bounds, augmented_inequality_values);
     exact_merit_value(
         time_callback(
             &mut profiling.objective_value,
@@ -558,7 +654,7 @@ where
             || problem.objective_value(x, parameters),
         ),
         equality_values,
-        inequality_values,
+        augmented_inequality_values,
         penalty,
     )
 }
@@ -895,23 +991,26 @@ fn log_boxed_section(title: &str, lines: &[String], title_style: fn(&str) -> Str
 }
 
 fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOptions) {
+    let has_inequality_like_constraints = !summary.inequality_multipliers.is_empty()
+        || !summary.lower_bound_multipliers.is_empty()
+        || !summary.upper_bound_multipliers.is_empty();
     let eq_text = if summary.equality_multipliers.is_empty() {
         "--".to_string()
     } else {
         style_residual_text(summary.equality_inf_norm, options.constraint_tol)
     };
-    let ineq_text = if summary.inequality_multipliers.is_empty() {
-        "--".to_string()
-    } else {
+    let ineq_text = if has_inequality_like_constraints {
         style_residual_text(summary.inequality_inf_norm, options.constraint_tol)
-    };
-    let comp_text = if summary.inequality_multipliers.is_empty() {
-        "--".to_string()
     } else {
+        "--".to_string()
+    };
+    let comp_text = if has_inequality_like_constraints {
         style_residual_text(
             summary.complementarity_inf_norm,
             options.complementarity_tol,
         )
+    } else {
+        "--".to_string()
     };
     let callback_total_time = summary.profiling.total_callback_time();
     let callback_rows = [
@@ -1305,16 +1404,22 @@ where
 
     let equality_count = problem.equality_count();
     let inequality_count = problem.inequality_count();
-    let total_constraint_count = equality_count + inequality_count;
+    let bounds = collect_bound_constraints(problem)?;
+    let lower_bound_count = bounds.lower_indices.len();
+    let augmented_inequality_count = inequality_count + bounds.total_count();
+    let total_constraint_count = equality_count + augmented_inequality_count;
+    let bound_jacobian = build_bound_jacobian(&bounds, n);
     let mut x = x0.to_vec();
     let mut gradient = vec![0.0; n];
     let mut equality_values = vec![0.0; equality_count];
     let mut inequality_values = vec![0.0; inequality_count];
+    let mut augmented_inequality_values = vec![0.0; augmented_inequality_count];
     let mut hessian_values = vec![0.0; problem.lagrangian_hessian_ccs().nnz()];
     let mut equality_jacobian_values = vec![0.0; problem.equality_jacobian_ccs().nnz()];
     let mut inequality_jacobian_values = vec![0.0; problem.inequality_jacobian_ccs().nnz()];
     let mut trial_equality_values = vec![0.0; equality_count];
     let mut trial_inequality_values = vec![0.0; inequality_count];
+    let mut trial_augmented_inequality_values = vec![0.0; augmented_inequality_count];
     let mut equality_multipliers = vec![0.0; equality_count];
     let mut inequality_multipliers = vec![0.0; inequality_count];
     let mut merit_penalty = options.merit_penalty;
@@ -1349,6 +1454,12 @@ where
             &mut iteration_callback_time,
             || problem.inequality_values(&x, parameters, &mut inequality_values),
         );
+        augment_inequality_values(
+            &inequality_values,
+            &x,
+            &bounds,
+            &mut augmented_inequality_values,
+        );
         time_callback(
             &mut profiling.equality_jacobian_values,
             &mut iteration_callback_time,
@@ -1361,12 +1472,13 @@ where
         );
         let equality_jacobian =
             ccs_to_dense(problem.equality_jacobian_ccs(), &equality_jacobian_values);
-        let inequality_jacobian = ccs_to_dense(
+        let nonlinear_inequality_jacobian = ccs_to_dense(
             problem.inequality_jacobian_ccs(),
             &inequality_jacobian_values,
         );
+        let inequality_jacobian = stack_jacobians(&nonlinear_inequality_jacobian, &bound_jacobian);
         let equality_inf = inf_norm(&equality_values);
-        let inequality_inf = positive_part_inf_norm(&inequality_values);
+        let inequality_inf = positive_part_inf_norm(&augmented_inequality_values);
         let primal_inf = equality_inf.max(inequality_inf);
 
         time_callback(
@@ -1390,12 +1502,16 @@ where
             step,
             candidate_equality_multipliers,
             candidate_inequality_multipliers,
+            candidate_lower_bound_multipliers,
+            candidate_upper_bound_multipliers,
             qp_status,
             qp_iterations,
             qp_solve_time_secs,
         ) = if total_constraint_count == 0 {
             (
                 solve_unconstrained_quadratic_step(&hessian, &gradient)?,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 None,
@@ -1411,13 +1527,13 @@ where
                 .iter()
                 .map(|value| -value)
                 .collect::<Vec<_>>();
-            b.extend(inequality_values.iter().map(|value| -value));
+            b.extend(augmented_inequality_values.iter().map(|value| -value));
             let mut cones = Vec::with_capacity(2);
             if equality_count > 0 {
                 cones.push(ZeroConeT(equality_count));
             }
-            if inequality_count > 0 {
-                cones.push(NonnegativeConeT(inequality_count));
+            if augmented_inequality_count > 0 {
+                cones.push(NonnegativeConeT(augmented_inequality_count));
             }
             let settings = DefaultSettingsBuilder::default()
                 .verbose(false)
@@ -1439,28 +1555,45 @@ where
             if !matches!(status, SolverStatus::Solved | SolverStatus::AlmostSolved) {
                 return Err(ClarabelSqpError::QpSolve { status });
             }
-            let (candidate_equality_multipliers, candidate_inequality_multipliers) =
+            let (candidate_equality_multipliers, candidate_augmented_inequality_multipliers) =
                 split_multipliers(&solver.solution.z, equality_count);
+            let (
+                candidate_inequality_multipliers,
+                candidate_lower_bound_multipliers,
+                candidate_upper_bound_multipliers,
+            ) = split_augmented_inequality_multipliers(
+                &candidate_augmented_inequality_multipliers,
+                inequality_count,
+                lower_bound_count,
+            );
             (
                 solver.solution.x.clone(),
                 candidate_equality_multipliers,
                 candidate_inequality_multipliers,
+                candidate_lower_bound_multipliers,
+                candidate_upper_bound_multipliers,
                 Some(solver.solution.status),
                 Some(solver.solution.iterations),
                 Some(qp_solve_elapsed.as_secs_f64()),
             )
         };
 
+        let all_inequality_multipliers = [
+            candidate_inequality_multipliers.as_slice(),
+            candidate_lower_bound_multipliers.as_slice(),
+            candidate_upper_bound_multipliers.as_slice(),
+        ]
+        .concat();
         let dual_residual = lagrangian_gradient(
             &gradient,
             &equality_jacobian,
             &candidate_equality_multipliers,
             &inequality_jacobian,
-            &candidate_inequality_multipliers,
+            &all_inequality_multipliers,
         );
         let dual_inf = inf_norm(&dual_residual);
         let complementarity_inf =
-            complementarity_inf_norm(&inequality_values, &candidate_inequality_multipliers);
+            complementarity_inf_norm(&augmented_inequality_values, &all_inequality_multipliers);
         if primal_inf <= options.constraint_tol
             && dual_inf <= options.dual_tol
             && complementarity_inf <= options.complementarity_tol
@@ -1473,6 +1606,8 @@ where
                 x,
                 equality_multipliers: candidate_equality_multipliers,
                 inequality_multipliers: candidate_inequality_multipliers,
+                lower_bound_multipliers: candidate_lower_bound_multipliers,
+                upper_bound_multipliers: candidate_upper_bound_multipliers,
                 objective: objective_value,
                 iterations: iteration,
                 equality_inf_norm: equality_inf,
@@ -1487,7 +1622,7 @@ where
                     SQP_LOG_HAS_EQUALITIES
                 } else {
                     0
-                }) | (if inequality_count > 0 {
+                }) | (if augmented_inequality_count > 0 {
                     SQP_LOG_HAS_INEQUALITIES
                 } else {
                     0
@@ -1533,19 +1668,19 @@ where
         merit_penalty = update_merit_penalty(
             merit_penalty,
             &candidate_equality_multipliers,
-            &candidate_inequality_multipliers,
+            &all_inequality_multipliers,
         );
         let current_merit = exact_merit_value(
             objective_value,
             &equality_values,
-            &inequality_values,
+            &augmented_inequality_values,
             merit_penalty,
         );
         let mut directional_derivative = exact_merit_directional_derivative(
             &gradient,
             &equality_values,
             &equality_jacobian,
-            &inequality_values,
+            &augmented_inequality_values,
             &inequality_jacobian,
             &step,
             merit_penalty,
@@ -1559,7 +1694,7 @@ where
                 &gradient,
                 &equality_values,
                 &equality_jacobian,
-                &inequality_values,
+                &augmented_inequality_values,
                 &inequality_jacobian,
                 &step,
                 merit_penalty,
@@ -1587,7 +1722,12 @@ where
                 problem,
                 &trial,
                 parameters,
-                (&mut trial_equality_values, &mut trial_inequality_values),
+                (
+                    &mut trial_equality_values,
+                    &mut trial_inequality_values,
+                    &mut trial_augmented_inequality_values,
+                ),
+                &bounds,
                 merit_penalty,
                 (&mut profiling, &mut iteration_callback_time),
             );
@@ -1617,7 +1757,7 @@ where
                 SQP_LOG_HAS_EQUALITIES
             } else {
                 0
-            }) | (if inequality_count > 0 {
+            }) | (if augmented_inequality_count > 0 {
                 SQP_LOG_HAS_INEQUALITIES
             } else {
                 0

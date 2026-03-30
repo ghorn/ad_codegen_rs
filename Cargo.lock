@@ -1641,6 +1641,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "llvm-sys",
+ "proptest",
  "rstest",
  "sx_codegen",
  "sx_core",
