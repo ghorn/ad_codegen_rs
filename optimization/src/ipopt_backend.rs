@@ -5,12 +5,16 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use ipopt::{
-    BasicProblem, ConstrainedProblem, Index as IpoptIndex, IntermediateCallbackData, Ipopt,
-    NewtonProblem, Number, SolveStatus,
+    AlgorithmMode, BasicProblem, ConstrainedProblem, Index as IpoptIndex,
+    IntermediateCallbackData, Ipopt, NewtonProblem, Number, SolveStatus,
 };
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const IPOPT_INF: f64 = 1e20;
+const IPOPT_JOURNAL_PRINT_LEVEL: i32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpoptMuStrategy {
@@ -56,6 +60,36 @@ impl Default for IpoptOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpoptIterationPhase {
+    Regular,
+    Restoration,
+}
+
+impl From<AlgorithmMode> for IpoptIterationPhase {
+    fn from(value: AlgorithmMode) -> Self {
+        match value {
+            AlgorithmMode::Regular => Self::Regular,
+            AlgorithmMode::RestorationPhase => Self::Restoration,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IpoptIterationSnapshot {
+    pub iteration: Index,
+    pub phase: IpoptIterationPhase,
+    pub objective: f64,
+    pub primal_inf: f64,
+    pub dual_inf: f64,
+    pub barrier_parameter: f64,
+    pub step_inf: f64,
+    pub regularization_size: f64,
+    pub alpha_pr: f64,
+    pub alpha_du: f64,
+    pub line_search_trials: Index,
+}
+
 #[derive(Clone, Debug)]
 pub struct IpoptSummary {
     pub x: Vec<f64>,
@@ -71,6 +105,8 @@ pub struct IpoptSummary {
     pub primal_inf_norm: f64,
     pub dual_inf_norm: f64,
     pub complementarity_inf_norm: f64,
+    pub snapshots: Vec<IpoptIterationSnapshot>,
+    pub journal_output: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -82,7 +118,12 @@ pub enum IpoptSolveError {
     #[error("ipopt rejected option `{name}`")]
     OptionRejected { name: String },
     #[error("ipopt failed with status {status:?}")]
-    Solve { status: SolveStatus },
+    Solve {
+        status: SolveStatus,
+        iterations: Index,
+        snapshots: Vec<IpoptIterationSnapshot>,
+        journal_output: Option<String>,
+    },
 }
 
 fn ccs_triplet_indices(
@@ -142,6 +183,7 @@ struct IpoptProblemAdapter<'a, P> {
     hessian_rows: Vec<IpoptIndex>,
     hessian_cols: Vec<IpoptIndex>,
     iterations: Index,
+    snapshots: Vec<IpoptIterationSnapshot>,
 }
 
 impl<'a, P> IpoptProblemAdapter<'a, P>
@@ -170,11 +212,25 @@ where
             hessian_rows,
             hessian_cols,
             iterations: 0,
+            snapshots: Vec::new(),
         })
     }
 
-    fn update_iterations(&mut self, data: IntermediateCallbackData) -> bool {
+    fn record_iteration(&mut self, data: IntermediateCallbackData) -> bool {
         self.iterations = data.iter_count as usize;
+        self.snapshots.push(IpoptIterationSnapshot {
+            iteration: data.iter_count as usize,
+            phase: data.alg_mod.into(),
+            objective: data.obj_value,
+            primal_inf: data.inf_pr,
+            dual_inf: data.inf_du,
+            barrier_parameter: data.mu,
+            step_inf: data.d_norm,
+            regularization_size: data.regularization_size,
+            alpha_pr: data.alpha_pr,
+            alpha_du: data.alpha_du,
+            line_search_trials: data.ls_trials as usize,
+        });
         true
     }
 
@@ -362,6 +418,32 @@ fn solve_status_is_success(status: SolveStatus) -> bool {
     )
 }
 
+fn open_ipopt_journal<P>(solver: &mut Ipopt<P>) -> Option<PathBuf>
+where
+    P: BasicProblem,
+{
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "ad_codegen_ipopt_{}_{}.log",
+        std::process::id(),
+        timestamp
+    ));
+    let path_text = path.to_string_lossy().into_owned();
+    solver
+        .open_output_file(&path_text, IPOPT_JOURNAL_PRINT_LEVEL)
+        .map(|_| path)
+}
+
+fn read_ipopt_journal(path: Option<PathBuf>) -> Option<String> {
+    let path = path?;
+    let journal = fs::read_to_string(&path).ok();
+    let _ = fs::remove_file(&path);
+    journal.filter(|text| !text.trim().is_empty())
+}
+
 pub fn solve_nlp_ipopt<'a, P>(
     problem: &'a P,
     x0: &'a [f64],
@@ -401,7 +483,8 @@ where
         if options.suppress_banner {
             set_ipopt_option(&mut solver, "sb", "yes")?;
         }
-        solver.set_intermediate_callback(Some(IpoptProblemAdapter::update_iterations));
+        let journal_path = open_ipopt_journal(&mut solver);
+        solver.set_intermediate_callback(Some(IpoptProblemAdapter::record_iteration));
         let solve_result = solver.solve();
         let status = solve_result.status;
         let objective = solve_result.objective_value;
@@ -417,8 +500,15 @@ where
             .upper_bound_multipliers
             .to_vec();
         let iterations = solve_result.solver_data.problem.iterations;
+        let snapshots = solve_result.solver_data.problem.snapshots.clone();
+        let journal_output = read_ipopt_journal(journal_path);
         if !solve_status_is_success(status) {
-            return Err(IpoptSolveError::Solve { status });
+            return Err(IpoptSolveError::Solve {
+                status,
+                iterations,
+                snapshots,
+                journal_output,
+            });
         }
         return Ok(IpoptSummary {
             x,
@@ -434,6 +524,8 @@ where
             primal_inf_norm: 0.0,
             dual_inf_norm: 0.0,
             complementarity_inf_norm: 0.0,
+            snapshots,
+            journal_output,
         });
     }
 
@@ -458,7 +550,8 @@ where
     if options.suppress_banner {
         set_ipopt_option(&mut solver, "sb", "yes")?;
     }
-    solver.set_intermediate_callback(Some(IpoptProblemAdapter::update_iterations));
+    let journal_path = open_ipopt_journal(&mut solver);
+    solver.set_intermediate_callback(Some(IpoptProblemAdapter::record_iteration));
 
     let solve_result = solver.solve();
     let status = solve_result.status;
@@ -475,13 +568,20 @@ where
         .upper_bound_multipliers
         .to_vec();
     let iterations = solve_result.solver_data.problem.iterations;
+    let snapshots = solve_result.solver_data.problem.snapshots.clone();
+    let journal_output = read_ipopt_journal(journal_path);
     let constraint_multipliers = solve_result
         .solver_data
         .solution
         .constraint_multipliers
         .to_vec();
     if !solve_status_is_success(status) {
-        return Err(IpoptSolveError::Solve { status });
+        return Err(IpoptSolveError::Solve {
+            status,
+            iterations,
+            snapshots,
+            journal_output,
+        });
     }
 
     let equality_count = problem.equality_count();
@@ -531,5 +631,7 @@ where
         primal_inf_norm,
         dual_inf_norm,
         complementarity_inf_norm,
+        snapshots,
+        journal_output,
     })
 }

@@ -350,7 +350,10 @@ fn interior_point_reports_profiling_breakdown(
 
 #[test]
 fn interior_point_auto_prefers_sparse_qdldl_on_hanging_chain() {
-    let problem = build_problem_ok(hanging_chain_problem(CallbackBackend::Aot), CallbackBackend::Aot);
+    let problem = build_problem_ok(
+        hanging_chain_problem(CallbackBackend::Aot),
+        CallbackBackend::Aot,
+    );
     let summary = solve_ok(
         &problem,
         &hanging_chain_initial_guess(),

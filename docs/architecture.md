@@ -44,9 +44,25 @@ flowchart LR
 
 - exact-Hessian SQP using Clarabel subproblems
 - IPOPT adapter behind a feature flag
+- public symbolic/JIT NLP compile path:
+  - `#[derive(optimization::Vectorize)]`
+  - `symbolic_nlp(...)`
+  - `TypedSymbolicNlp::compile_jit()`
+  - `TypedCompiledJitNlp::solve_sqp(...)`
 - compiled NLP callback interface with:
   - one design-variable vector
   - zero or more parameter matrices
+- typed SQP telemetry callback surface:
+  - `solve_nlp_sqp_with_callback`
+  - typed iteration snapshots, QP info, line-search info, and termination data
+
+## Symbolic NLP layering
+
+- the public API is the typed scalar-structured layer
+- the raw symbolic spec is an internal implementation detail
+- runtime variable and nonlinear constraint bounds are applied at solve time
+
+Structured borrowed views and flatten/unflatten runtime helpers are still deferred. The current public layer uses typed `SX` leaves plus runtime flattening internally.
 
 ## Testing model
 

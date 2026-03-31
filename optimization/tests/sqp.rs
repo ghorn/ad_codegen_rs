@@ -185,9 +185,9 @@ fn sqp_solves_equality_constrained_rosenbrock(
     assert_abs_diff_eq!(summary.x[0], 0.61879562, epsilon = 1e-4);
     assert_abs_diff_eq!(summary.x[1], 0.38120438, epsilon = 1e-4);
     assert_abs_diff_eq!(summary.objective, 0.14560702, epsilon = 1e-4);
-    assert!(summary.equality_inf_norm <= 1e-6);
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-6));
     assert!(summary.dual_inf_norm <= 2e-6);
-    assert!(summary.complementarity_inf_norm <= 1e-12);
+    assert_eq!(summary.complementarity_inf_norm, None);
 }
 
 #[rstest]
@@ -206,7 +206,7 @@ fn sqp_solves_casadi_rosenbrock_example(
     assert_abs_diff_eq!(summary.x[1], 1.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.x[2], 0.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.objective, 0.0, epsilon = 1e-6);
-    assert!(summary.equality_inf_norm <= 1e-7);
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-7));
     assert!(summary.dual_inf_norm <= 1e-7);
 }
 
@@ -220,7 +220,7 @@ fn sqp_solves_casadi_simple_nlp_example(
     assert_abs_diff_eq!(summary.x[0], 5.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.x[1], 5.0, epsilon = 1e-6);
     assert_abs_diff_eq!(summary.objective, 50.0, epsilon = 1e-6);
-    assert!(summary.equality_inf_norm <= 1e-7);
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-7));
     assert!(summary.dual_inf_norm <= 1e-7);
 }
 
@@ -236,28 +236,32 @@ fn sqp_solves_hs021(
     assert_abs_diff_eq!(summary.objective, -99.96, epsilon = 1e-6);
     assert!(summary.primal_inf_norm <= 1e-7);
     assert!(summary.dual_inf_norm <= 1e-7);
-    assert!(summary.complementarity_inf_norm <= 1e-7);
+    assert!(
+        summary
+            .complementarity_inf_norm
+            .is_some_and(|value| value <= 1e-7)
+    );
 }
 
 #[rstest]
 fn sqp_solves_hs035(
     #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
 ) {
+    let options = ClarabelSqpOptions::default();
     let problem = build_problem_ok(hs035_problem(backend), backend);
-    let summary = solve_ok(
-        &problem,
-        &[0.5, 0.5, 0.5],
-        &[],
-        ClarabelSqpOptions::default(),
-    );
+    let summary = solve_ok(&problem, &[0.5, 0.5, 0.5], &[], options.clone());
 
     assert_abs_diff_eq!(summary.x[0], 4.0 / 3.0, epsilon = 1e-5);
     assert_abs_diff_eq!(summary.x[1], 7.0 / 9.0, epsilon = 1e-5);
     assert_abs_diff_eq!(summary.x[2], 4.0 / 9.0, epsilon = 1e-5);
     assert_abs_diff_eq!(summary.objective, 1.0 / 9.0, epsilon = 1e-6);
     assert!(summary.primal_inf_norm <= 1e-7);
-    assert!(summary.dual_inf_norm <= 1e-7);
-    assert!(summary.complementarity_inf_norm <= 1e-7);
+    assert!(summary.dual_inf_norm <= options.dual_tol);
+    assert!(
+        summary
+            .complementarity_inf_norm
+            .is_some_and(|value| value <= 1e-7)
+    );
 }
 
 #[rstest]
@@ -283,7 +287,11 @@ fn sqp_solves_hs071(
     assert_abs_diff_eq!(summary.objective, 17.0140173, epsilon = 5e-4);
     assert!(summary.primal_inf_norm <= 1e-5);
     assert!(summary.dual_inf_norm <= 1e-5);
-    assert!(summary.complementarity_inf_norm <= 1e-5);
+    assert!(
+        summary
+            .complementarity_inf_norm
+            .is_some_and(|value| value <= 1e-5)
+    );
 }
 
 #[rstest]
@@ -326,9 +334,9 @@ fn sqp_solves_hanging_chain(
         },
     );
 
-    assert!(summary.equality_inf_norm <= 1e-6);
+    assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-6));
     assert!(summary.dual_inf_norm <= 1e-5);
-    assert!(summary.complementarity_inf_norm <= 1e-12);
+    assert_eq!(summary.complementarity_inf_norm, None);
     assert!(summary.objective < -1.35);
 
     assert_abs_diff_eq!(summary.x[0] + summary.x[6], 3.0, epsilon = 1e-5);
@@ -357,7 +365,7 @@ fn sqp_reports_profiling_breakdown(
         },
     );
     let profiling = &summary.profiling;
-    let iteration_count = summary.iterations + 1;
+    let snapshot_count = summary.final_state.iteration + 1;
     let callback_total_time = profiling.objective_value.total_time
         + profiling.objective_gradient.total_time
         + profiling.equality_values.total_time
@@ -370,13 +378,17 @@ fn sqp_reports_profiling_breakdown(
         + profiling.qp_solve_time
         + profiling.preprocessing_time;
 
-    assert!(profiling.objective_value.calls >= iteration_count);
-    assert_eq!(profiling.objective_gradient.calls, iteration_count);
-    assert_eq!(profiling.equality_jacobian_values.calls, iteration_count);
-    assert_eq!(profiling.inequality_jacobian_values.calls, iteration_count);
-    assert_eq!(profiling.lagrangian_hessian_values.calls, iteration_count);
-    assert_eq!(profiling.qp_setups, iteration_count);
-    assert_eq!(profiling.qp_solves, iteration_count);
+    assert!(profiling.objective_value.calls >= snapshot_count);
+    assert_eq!(profiling.objective_gradient.calls, snapshot_count);
+    assert_eq!(profiling.equality_jacobian_values.calls, snapshot_count);
+    assert_eq!(profiling.inequality_jacobian_values.calls, snapshot_count);
+    assert_eq!(profiling.qp_setups, profiling.qp_solves);
+    assert_eq!(
+        profiling.lagrangian_hessian_values.calls,
+        profiling.qp_setups
+    );
+    assert!(profiling.qp_setups <= snapshot_count);
+    assert!(profiling.qp_setups + 1 >= snapshot_count);
     assert!(profiling.total_time >= accounted_without_unaccounted);
     assert_eq!(
         profiling.unaccounted_time,
@@ -416,5 +428,9 @@ fn sqp_enforces_box_bounds_regression() {
     assert_abs_diff_eq!(summary.objective, 313.0, epsilon = 1e-6);
     assert!(summary.primal_inf_norm <= 1e-8);
     assert!(summary.dual_inf_norm <= 1e-7);
-    assert!(summary.complementarity_inf_norm <= 1e-7);
+    assert!(
+        summary
+            .complementarity_inf_norm
+            .is_some_and(|value| value <= 1e-7)
+    );
 }

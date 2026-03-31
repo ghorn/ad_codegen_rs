@@ -67,6 +67,15 @@ pub enum LlvmOptimizationLevel {
 }
 
 impl LlvmOptimizationLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::O0 => "O0",
+            Self::O2 => "O2",
+            Self::O3 => "O3",
+            Self::Os => "Os",
+        }
+    }
+
     fn codegen_level(self) -> LLVMCodeGenOptLevel {
         match self {
             Self::O0 => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,

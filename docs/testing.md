@@ -54,3 +54,10 @@ Optimization regressions run through compiled LLVM callbacks and cover:
 - hanging chain
 
 Both LLVM AOT and LLVM JIT backends are exercised.
+
+There are also public-surface tests for:
+
+- `#[derive(Vectorize)]` -> `symbolic_nlp(...)` -> `compile_jit()` -> `solve_sqp(...)`
+- typed SQP iteration callbacks
+- honest optional metrics in snapshots and summaries
+- strict non-finite input / callback rejection

@@ -1,0 +1,24 @@
+[package]
+name = "test_problems"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+ipopt = ["optimization/ipopt"]
+
+[dependencies]
+anyhow.workspace = true
+indicatif = "0.18.2"
+optimization = { path = "../optimization" }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sx_core = { path = "../sx_core" }
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -378,6 +378,7 @@ fn build_jit_problem(spec: ProblemSpec) -> Result<CallbackNlpProblem> {
         lagrangian_hessian_ccs,
         backend_timing: BackendTimingMetadata {
             function_creation_time: Some(creation_time),
+            derivative_generation_time: None,
             jit_time: Some(jit_time),
         },
         objective_value: Box::new(move |x, parameters| objective_kernel.eval_scalar(x, parameters)),

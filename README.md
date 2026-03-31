@@ -12,6 +12,15 @@
 
 This project is intentionally scoped around compiled execution. There is no public runtime interpreter for `SX`; evaluation happens through LLVM JIT or LLVM-generated native object code.
 
+The current public optimization path is:
+
+- define typed symbolic variables and parameters with `sx_core` + `optimization::Vectorize`
+- build the NLP with `optimization::symbolic_nlp(...)`
+- JIT-compile it with `.compile_jit()`
+- solve it with runtime variable / constraint bounds
+
+Structured borrowed views and flatten/unflatten runtime layout helpers are still deferred.
+
 ## Current Scope
 
 Implemented today:
@@ -110,6 +119,34 @@ PKG_CONFIG_PATH="$(brew --prefix ipopt)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CO
 cargo test -p optimization --features ipopt ipopt_solves_hanging_chain -- --nocapture
 ```
 
+### Public symbolic JIT NLP path
+
+```rust
+use optimization::{
+    ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, symbolic_nlp,
+};
+use sx_core::SX;
+
+#[derive(Clone, optimization::Vectorize)]
+struct Pair<T> {
+    x: T,
+    y: T,
+}
+
+let symbolic = symbolic_nlp::<Pair<SX>, (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
+    objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+    constraints: (),
+})?;
+
+let compiled = symbolic.compile_jit()?;
+let summary = compiled.solve_sqp(
+    &Pair { x: -1.2, y: 1.0 },
+    &(),
+    &TypedRuntimeNlpBounds::default(),
+    &ClarabelSqpOptions::default(),
+)?;
+```
+
 ## Reports
 
 AD cost report:
@@ -122,6 +159,12 @@ Parity audit report:
 
 ```bash
 cargo run -p xtask -- casadi-parity-report
+```
+
+Test-problem suite:
+
+```bash
+cargo run --release -p test_problems -- --problem-set fast --solver both --jobs 4 --output-dir target/test-problems
 ```
 
 Outputs are written under [target/reports](/Users/greg/dev/ad_codegen/target/reports).
@@ -142,6 +185,7 @@ The symbolic evaluator used in tests is intentionally test-only. Public/runtime 
 
 - [docs/getting-started.md](/Users/greg/dev/ad_codegen/docs/getting-started.md)
 - [docs/architecture.md](/Users/greg/dev/ad_codegen/docs/architecture.md)
+- [docs/symbolic-nlp.md](/Users/greg/dev/ad_codegen/docs/symbolic-nlp.md)
 - [docs/testing.md](/Users/greg/dev/ad_codegen/docs/testing.md)
 
 ## License

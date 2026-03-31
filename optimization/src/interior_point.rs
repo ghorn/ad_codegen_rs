@@ -34,7 +34,7 @@ pub enum InteriorPointLinearSolver {
 }
 
 impl InteriorPointLinearSolver {
-    fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::SparseQdldl => "sparse_qdldl",
@@ -142,6 +142,38 @@ pub struct InteriorPointSummary {
     pub barrier_parameter: f64,
     pub profiling: InteriorPointProfiling,
     pub linear_solver: InteriorPointLinearSolver,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorPointIterationPhase {
+    AcceptedStep,
+    Converged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorPointIterationEvent {
+    SigmaAdjusted,
+    LongLineSearch,
+    LinearSolverFallback,
+    MaxIterationsReached,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteriorPointIterationSnapshot {
+    pub iteration: Index,
+    pub phase: InteriorPointIterationPhase,
+    pub x: Vec<f64>,
+    pub objective: f64,
+    pub eq_inf: Option<f64>,
+    pub ineq_inf: Option<f64>,
+    pub dual_inf: f64,
+    pub comp_inf: Option<f64>,
+    pub barrier_parameter: Option<f64>,
+    pub alpha: Option<f64>,
+    pub line_search_iterations: Option<Index>,
+    pub linear_solver: InteriorPointLinearSolver,
+    pub linear_solve_time: Option<Duration>,
+    pub events: Vec<InteriorPointIterationEvent>,
 }
 
 #[derive(Debug, Error)]
@@ -336,13 +368,13 @@ where
         problem.objective_value(x, parameters)
     });
     time_callback(&mut profiling.objective_gradient, callback_time, || {
-        problem.objective_gradient(x, parameters, &mut gradient)
+        problem.objective_gradient(x, parameters, &mut gradient);
     });
     time_callback(&mut profiling.equality_values, callback_time, || {
-        problem.equality_values(x, parameters, &mut equality_values)
+        problem.equality_values(x, parameters, &mut equality_values);
     });
     time_callback(&mut profiling.inequality_values, callback_time, || {
-        problem.inequality_values(x, parameters, &mut nonlinear_inequality_values)
+        problem.inequality_values(x, parameters, &mut nonlinear_inequality_values);
     });
     augment_inequality_values(
         &nonlinear_inequality_values,
@@ -1338,6 +1370,20 @@ pub fn solve_nlp_interior_point<P>(
 where
     P: CompiledNlpProblem,
 {
+    solve_nlp_interior_point_with_callback(problem, x0, parameters, options, |_| {})
+}
+
+pub fn solve_nlp_interior_point_with_callback<P, C>(
+    problem: &P,
+    x0: &[f64],
+    parameters: &[ParameterMatrix<'_>],
+    options: &InteriorPointOptions,
+    mut callback: C,
+) -> std::result::Result<InteriorPointSummary, InteriorPointSolveError>
+where
+    P: CompiledNlpProblem,
+    C: FnMut(&InteriorPointIterationSnapshot),
+{
     let solve_started = Instant::now();
     let mut profiling = InteriorPointProfiling {
         backend_timing: problem.backend_timing_metadata(),
@@ -1458,6 +1504,23 @@ where
             && dual_inf <= options.dual_tol
             && complementarity_inf <= options.complementarity_tol
         {
+            let snapshot = InteriorPointIterationSnapshot {
+                iteration,
+                phase: InteriorPointIterationPhase::Converged,
+                x: x.clone(),
+                objective: state.objective_value,
+                eq_inf: (equality_count > 0).then_some(equality_inf),
+                ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
+                dual_inf,
+                comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+                barrier_parameter: (augmented_inequality_count > 0).then_some(mu),
+                alpha: None,
+                line_search_iterations: None,
+                linear_solver: last_linear_solver,
+                linear_solve_time: None,
+                events: Vec::new(),
+            };
+            callback(&snapshot);
             let (nonlinear_ineq, lower_bounds, upper_bounds) =
                 split_augmented_inequality_multipliers(&z, inequality_count, lower_bound_count);
             let summary = InteriorPointSummary {
@@ -1908,6 +1971,38 @@ where
                 &mut event_state,
             );
         }
+
+        let solver_fell_back = options.linear_solver != InteriorPointLinearSolver::Auto
+            && direction.solver_used != options.linear_solver;
+        let mut events = Vec::new();
+        if sigma_adjusted {
+            events.push(InteriorPointIterationEvent::SigmaAdjusted);
+        }
+        if line_search_iterations >= 4 {
+            events.push(InteriorPointIterationEvent::LongLineSearch);
+        }
+        if solver_fell_back {
+            events.push(InteriorPointIterationEvent::LinearSolverFallback);
+        }
+        if iteration + 1 == options.max_iters {
+            events.push(InteriorPointIterationEvent::MaxIterationsReached);
+        }
+        callback(&InteriorPointIterationSnapshot {
+            iteration,
+            phase: InteriorPointIterationPhase::AcceptedStep,
+            x: x.clone(),
+            objective: state.objective_value,
+            eq_inf: (equality_count > 0).then_some(equality_inf),
+            ineq_inf: (augmented_inequality_count > 0).then_some(inequality_inf),
+            dual_inf,
+            comp_inf: (augmented_inequality_count > 0).then_some(complementarity_inf),
+            barrier_parameter: (augmented_inequality_count > 0).then_some(mu.max(options.mu_min)),
+            alpha: Some(alpha),
+            line_search_iterations: Some(line_search_iterations),
+            linear_solver: direction.solver_used,
+            linear_solve_time: Some(iteration_linear_solve_time),
+            events,
+        });
 
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
             iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,

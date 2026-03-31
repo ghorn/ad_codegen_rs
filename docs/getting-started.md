@@ -42,6 +42,18 @@ cargo llvm-cov --workspace --summary-only
 
 ## Optimization Runs
 
+Public symbolic JIT NLP tests:
+
+```bash
+cargo test -p optimization --test symbolic_jit_nlp
+```
+
+SQP callback / finite-validation tests:
+
+```bash
+cargo test -p optimization --test sqp_callback_api
+```
+
 SQP hanging chain:
 
 ```bash
