@@ -21,6 +21,27 @@ The current public optimization path is:
 
 Structured borrowed views and flatten/unflatten runtime layout helpers are still deferred.
 
+## Using From Another Project
+
+These crates are intended to be consumed from Git for now. They are not published to crates.io yet, and the workspace currently marks packages `publish = false` to avoid accidental publication while the API and naming are still experimental.
+
+Example:
+
+```toml
+[dependencies]
+sx_core = { git = "https://github.com/ghorn/ad_codegen_rs.git" }
+optimization = { git = "https://github.com/ghorn/ad_codegen_rs.git" }
+```
+
+With IPOPT enabled:
+
+```toml
+[dependencies]
+optimization = { git = "https://github.com/ghorn/ad_codegen_rs.git", features = ["ipopt"] }
+```
+
+Cargo will pull the whole workspace and resolve the internal path dependencies automatically.
+
 ## Current Scope
 
 Implemented today:

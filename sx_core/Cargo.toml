@@ -2,8 +2,12 @@
 name = "sx_core"
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish = false
+repository.workspace = true
 rust-version.workspace = true
+description = "Symbolic scalar expressions, sparse SX matrices, and automatic differentiation for ad_codegen_rs."
 
 [lints]
 workspace = true

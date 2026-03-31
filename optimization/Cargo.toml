@@ -2,8 +2,12 @@
 name = "optimization"
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish = false
+repository.workspace = true
 rust-version.workspace = true
+description = "Exact-Hessian nonlinear optimization, symbolic JIT NLP construction, and solver integrations for ad_codegen_rs."
 
 [lints]
 workspace = true

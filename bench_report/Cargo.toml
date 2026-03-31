@@ -2,8 +2,12 @@
 name = "bench_report"
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish = false
+repository.workspace = true
 rust-version.workspace = true
+description = "Internal benchmark and report rendering utilities for ad_codegen_rs."
 
 [lints]
 workspace = true

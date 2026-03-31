@@ -2,8 +2,12 @@
 name = "sx_codegen_llvm"
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish = false
+repository.workspace = true
 rust-version.workspace = true
+description = "LLVM JIT and AOT code generation for symbolic SX functions in ad_codegen_rs."
 
 [lints]
 workspace = true

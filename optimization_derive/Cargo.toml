@@ -2,8 +2,12 @@
 name = "optimization_derive"
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish = false
+repository.workspace = true
 rust-version.workspace = true
+description = "Derive macros for typed symbolic NLP layout/vectorization in ad_codegen_rs."
 
 [lints]
 workspace = true
