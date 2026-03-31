@@ -21,10 +21,7 @@ fn assert_known_passing_solver(solver: SolverKind, speed: Option<ProblemSpeed>) 
     let failing = results
         .records
         .iter()
-        .filter(|record| {
-            record.expected == KnownStatus::KnownPassing
-                && !record.status.accepted()
-        })
+        .filter(|record| record.expected == KnownStatus::KnownPassing && !record.status.accepted())
         .collect::<Vec<_>>();
     assert!(
         failing.is_empty(),

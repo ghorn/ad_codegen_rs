@@ -999,7 +999,7 @@ fn log_interior_point_iteration(
     log: &InteriorPointIterationLog,
     event_state: &mut SqpEventLegendState,
 ) {
-    if log.iteration.is_multiple_of(20) {
+    if log.iteration.is_multiple_of(10) {
         eprintln!();
         let header = [
             format!("{:>4}", "iter"),

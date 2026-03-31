@@ -359,8 +359,12 @@ where
                     } else if matches!(record.validation.tier, ValidationTier::ReducedAccuracy) {
                         record.status = RunStatus::ReducedAccuracy;
                     }
-                    record.console_output =
-                        Some(render_sqp_transcript(&record, &snapshots, Some(&summary), None));
+                    record.console_output = Some(render_sqp_transcript(
+                        &record,
+                        &snapshots,
+                        Some(&summary),
+                        None,
+                    ));
                     record
                 }
                 Err(err) => {
@@ -509,12 +513,9 @@ where
             };
             let solver_thresholds = format_ipopt_thresholds(&ipopt_options);
             let solve_started = Instant::now();
-            let result = data.compiled.solve_ipopt(
-                &data.x0,
-                &data.parameters,
-                &data.bounds,
-                &ipopt_options,
-            );
+            let result =
+                data.compiled
+                    .solve_ipopt(&data.x0, &data.parameters, &data.bounds, &ipopt_options);
             let solve_wall_time = solve_started.elapsed();
             match result {
                 Ok(summary) => {
@@ -736,6 +737,8 @@ fn metrics_from_sqp_summary(summary: &ClarabelSqpSummary) -> SolverMetrics {
         primal_inf: Some(summary.primal_inf_norm),
         dual_inf: Some(summary.dual_inf_norm),
         complementarity_inf: summary.complementarity_inf_norm,
+        elastic_recovery_activations: Some(summary.profiling.elastic_recovery_activations),
+        elastic_recovery_qp_solves: Some(summary.profiling.elastic_recovery_qp_solves),
     }
 }
 
@@ -772,6 +775,8 @@ fn metrics_from_sqp_error(error: &ClarabelSqpError) -> SolverMetrics {
         }),
         dual_inf: snapshot.map(|state| state.dual_inf),
         complementarity_inf: snapshot.and_then(|state| state.comp_inf),
+        elastic_recovery_activations: Some(context.profiling.elastic_recovery_activations),
+        elastic_recovery_qp_solves: Some(context.profiling.elastic_recovery_qp_solves),
     }
 }
 
@@ -799,6 +804,7 @@ fn metrics_from_interior_point_summary(summary: &InteriorPointSummary) -> Solver
         primal_inf: Some(summary.primal_inf_norm),
         dual_inf: Some(summary.dual_inf_norm),
         complementarity_inf: Some(summary.complementarity_inf_norm),
+        ..SolverMetrics::default()
     }
 }
 
@@ -824,6 +830,7 @@ fn metrics_from_ipopt_summary(summary: &IpoptSummary) -> SolverMetrics {
         primal_inf: Some(summary.primal_inf_norm),
         dual_inf: Some(summary.dual_inf_norm),
         complementarity_inf: Some(summary.complementarity_inf_norm),
+        ..SolverMetrics::default()
     }
 }
 
@@ -844,6 +851,7 @@ fn metrics_from_ipopt_error(error: &IpoptSolveError) -> SolverMetrics {
                 primal_inf: last.map(|snapshot| snapshot.primal_inf),
                 dual_inf: last.map(|snapshot| snapshot.dual_inf),
                 complementarity_inf: None,
+                ..SolverMetrics::default()
             }
         }
         IpoptSolveError::InvalidInput(_)
@@ -889,7 +897,11 @@ fn render_problem_header(record: &ProblemRunRecord) -> String {
     if let Some(thresholds) = &record.solver_thresholds {
         let _ = writeln!(out, "termination_thresholds: {thresholds}");
     }
-    let _ = writeln!(out, "validation_thresholds: {}", record.validation.tolerance);
+    let _ = writeln!(
+        out,
+        "validation_thresholds: {}",
+        record.validation.tolerance
+    );
     out.push('\n');
     out
 }
@@ -898,13 +910,21 @@ fn render_problem_footer(record: &ProblemRunRecord) -> String {
     let mut out = String::new();
     out.push_str("\nresult\n");
     let _ = writeln!(out, "  status: {}", status_text(record.status));
-    let _ = writeln!(out, "  iterations: {}", fmt_opt_usize(record.metrics.iterations));
+    let _ = writeln!(
+        out,
+        "  iterations: {}",
+        fmt_opt_usize(record.metrics.iterations)
+    );
     let _ = writeln!(
         out,
         "  total_time: {}",
         crate::report::format_duration(record.timing.total_wall_time)
     );
-    let _ = writeln!(out, "  objective: {}", fmt_opt_sci(record.metrics.objective));
+    let _ = writeln!(
+        out,
+        "  objective: {}",
+        fmt_opt_sci(record.metrics.objective)
+    );
     let _ = writeln!(out, "  primal: {}", fmt_opt_sci(record.metrics.primal_inf));
     let _ = writeln!(out, "  dual: {}", fmt_opt_sci(record.metrics.dual_inf));
     let _ = writeln!(
@@ -912,8 +932,24 @@ fn render_problem_footer(record: &ProblemRunRecord) -> String {
         "  complementarity: {}",
         fmt_opt_sci(record.metrics.complementarity_inf)
     );
-    let _ = writeln!(out, "  termination_thresholds: {}", record.solver_thresholds.as_deref().unwrap_or("--"));
-    let _ = writeln!(out, "  validation_thresholds: {}", record.validation.tolerance);
+    let _ = writeln!(
+        out,
+        "  emergency_restorations: {}",
+        fmt_elastic_stats(
+            record.metrics.elastic_recovery_activations,
+            record.metrics.elastic_recovery_qp_solves,
+        )
+    );
+    let _ = writeln!(
+        out,
+        "  termination_thresholds: {}",
+        record.solver_thresholds.as_deref().unwrap_or("--")
+    );
+    let _ = writeln!(
+        out,
+        "  validation_thresholds: {}",
+        record.validation.tolerance
+    );
     let _ = writeln!(out, "  validation: {}", record.validation.detail);
     if let Some(error) = &record.error {
         let _ = writeln!(out, "  error: {error}");
@@ -929,25 +965,41 @@ fn render_sqp_transcript(
 ) -> String {
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
-    let _ = writeln!(
-        out,
+    let header = format!(
         "{:>4}  {:<6}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>5}  {:>5}",
-        "iter", "phase", "f", "eq_inf", "ineq_inf", "dual_inf", "comp_inf", "step_inf", "penalty", "alpha", "ls", "qp", "evt"
+        "iter",
+        "phase",
+        "f",
+        "eq_inf",
+        "ineq_inf",
+        "dual_inf",
+        "comp_inf",
+        "step_inf",
+        "penalty",
+        "alpha",
+        "ls",
+        "qp",
+        "evt"
     );
-    for snapshot in snapshots {
+    write_repeated_header(&mut out, &header);
+    for (idx, snapshot) in snapshots.iter().enumerate() {
+        if idx > 0 && idx.is_multiple_of(10) {
+            out.push('\n');
+            write_repeated_header(&mut out, &header);
+        }
         let phase = match snapshot.phase {
             optimization::SqpIterationPhase::Initial => "initial",
             optimization::SqpIterationPhase::AcceptedStep => "accept",
             optimization::SqpIterationPhase::PostConvergence => "final",
         };
-        let qp = snapshot
-            .qp
-            .as_ref()
-            .map_or_else(|| "--".to_string(), |qp| match qp.status {
+        let qp = snapshot.qp.as_ref().map_or_else(
+            || "--".to_string(),
+            |qp| match qp.status {
                 optimization::SqpQpStatus::Solved => format!("{}", qp.iteration_count),
                 optimization::SqpQpStatus::ReducedAccuracy => format!("{}R", qp.iteration_count),
                 optimization::SqpQpStatus::Failed => "fail".to_string(),
-            });
+            },
+        );
         let events = if snapshot.events.is_empty() {
             "--".to_string()
         } else {
@@ -1007,12 +1059,28 @@ fn render_interior_point_transcript(
 ) -> String {
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
-    let _ = writeln!(
-        out,
+    let header = format!(
         "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>7}  {:>5}  {:>8}  {:>8}  {:>5}",
-        "iter", "phase", "f", "eq_inf", "ineq_inf", "dual_inf", "comp_inf", "mu", "alpha", "ls", "linear", "lin_t", "evt"
+        "iter",
+        "phase",
+        "f",
+        "eq_inf",
+        "ineq_inf",
+        "dual_inf",
+        "comp_inf",
+        "mu",
+        "alpha",
+        "ls",
+        "linear",
+        "lin_t",
+        "evt"
     );
-    for snapshot in snapshots {
+    write_repeated_header(&mut out, &header);
+    for (idx, snapshot) in snapshots.iter().enumerate() {
+        if idx > 0 && idx.is_multiple_of(10) {
+            out.push('\n');
+            write_repeated_header(&mut out, &header);
+        }
         let phase = match snapshot.phase {
             optimization::InteriorPointIterationPhase::AcceptedStep => "accept",
             optimization::InteriorPointIterationPhase::Converged => "final",
@@ -1081,8 +1149,7 @@ fn render_ipopt_transcript(
             | None => None,
         })
         .unwrap_or(&[]);
-    let _ = writeln!(
-        out,
+    let header = format!(
         "{:>4}  {:<7}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>11}  {:>8}  {:>8}  {:>5}",
         "iter",
         "phase",
@@ -1096,7 +1163,12 @@ fn render_ipopt_transcript(
         "alpha_du",
         "ls",
     );
-    for snapshot in snapshots {
+    write_repeated_header(&mut out, &header);
+    for (idx, snapshot) in snapshots.iter().enumerate() {
+        if idx > 0 && idx.is_multiple_of(10) {
+            out.push('\n');
+            write_repeated_header(&mut out, &header);
+        }
         let phase = match snapshot.phase {
             optimization::IpoptIterationPhase::Regular => "regular",
             optimization::IpoptIterationPhase::Restoration => "restore",
@@ -1160,6 +1232,10 @@ fn render_ipopt_transcript(
     }
     out.push_str(&render_problem_footer(record));
     out
+}
+
+fn write_repeated_header(out: &mut String, header: &str) {
+    let _ = writeln!(out, "{header}");
 }
 
 #[cfg(feature = "ipopt")]
@@ -1226,6 +1302,15 @@ fn fmt_opt_sci(value: Option<f64>) -> String {
 
 fn fmt_opt_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "--".to_string(), |value| value.to_string())
+}
+
+fn fmt_elastic_stats(activations: Option<usize>, recovery_qps: Option<usize>) -> String {
+    match (activations, recovery_qps) {
+        (Some(activations), Some(recovery_qps)) => {
+            format!("{activations} activations / {recovery_qps} recovery_qps")
+        }
+        _ => "--".to_string(),
+    }
 }
 
 fn status_text(status: RunStatus) -> &'static str {
@@ -1295,7 +1380,9 @@ pub(crate) fn exact_solution_validation(
         }
         let tier = if passed {
             ValidationTier::Passed
-        } else if record.error.is_none() && reduced_accuracy_residuals_met(record, REDUCED_TERMINATION_TOL) {
+        } else if record.error.is_none()
+            && reduced_accuracy_residuals_met(record, REDUCED_TERMINATION_TOL)
+        {
             detail.push_str(&format!(
                 ", reduced_accuracy(primal/dual/comp<={:.1e})",
                 REDUCED_TERMINATION_TOL
@@ -1367,7 +1454,9 @@ pub(crate) fn objective_validation(
         }
         let tier = if passed {
             ValidationTier::Passed
-        } else if record.error.is_none() && reduced_accuracy_residuals_met(record, REDUCED_TERMINATION_TOL) {
+        } else if record.error.is_none()
+            && reduced_accuracy_residuals_met(record, REDUCED_TERMINATION_TOL)
+        {
             detail.push_str(&format!(
                 ", reduced_accuracy(primal/dual/comp<={:.1e})",
                 REDUCED_TERMINATION_TOL

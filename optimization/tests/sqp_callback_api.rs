@@ -744,6 +744,8 @@ fn sqp_elastic_recovery_handles_primal_infeasible_linearization() {
     assert_abs_diff_eq!(summary.x[0].abs(), 1.0, epsilon = 1e-6);
     assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-6));
     assert!(summary.dual_inf_norm <= 1e-6);
+    assert_eq!(summary.profiling.elastic_recovery_activations, 1);
+    assert!(summary.profiling.elastic_recovery_qp_solves >= 1);
     assert!(snapshots.iter().any(|snapshot| {
         snapshot
             .events

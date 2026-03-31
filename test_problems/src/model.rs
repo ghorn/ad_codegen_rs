@@ -120,6 +120,8 @@ pub struct SolverMetrics {
     pub primal_inf: Option<f64>,
     pub dual_inf: Option<f64>,
     pub complementarity_inf: Option<f64>,
+    pub elastic_recovery_activations: Option<usize>,
+    pub elastic_recovery_qp_solves: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

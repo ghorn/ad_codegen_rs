@@ -5,8 +5,8 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use ipopt::{
-    AlgorithmMode, BasicProblem, ConstrainedProblem, Index as IpoptIndex,
-    IntermediateCallbackData, Ipopt, NewtonProblem, Number, SolveStatus,
+    AlgorithmMode, BasicProblem, ConstrainedProblem, Index as IpoptIndex, IntermediateCallbackData,
+    Ipopt, NewtonProblem, Number, SolveStatus,
 };
 use std::fs;
 use std::path::PathBuf;

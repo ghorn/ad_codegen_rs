@@ -632,7 +632,7 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         if let Some(bounds) = &self.variable_bounds.upper {
             upper.copy_from_slice(bounds);
         }
-        self.variable_bounds.lower.is_some() || self.variable_bounds.upper.is_some()
+        true
     }
 
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {

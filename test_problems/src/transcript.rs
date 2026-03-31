@@ -41,6 +41,15 @@ fn render_transcript_html(
 ) -> String {
     let (status_class, status_text) = status_badge(record.status);
     let reason = transcript_reason(record);
+    let elastic_stats = match (
+        record.metrics.elastic_recovery_activations,
+        record.metrics.elastic_recovery_qp_solves,
+    ) {
+        (Some(activations), Some(recovery_qps)) => {
+            format!("{activations} activations / {recovery_qps} recovery_qps")
+        }
+        _ => "--".to_string(),
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -87,6 +96,7 @@ fn render_transcript_html(
     <div class="summary">
       <div class="summary-card"><div class="summary-label">Status</div><div class="summary-value"><span class="badge {status_class}">{status_text}</span></div></div>
       <div class="summary-card"><div class="summary-label">Reason</div><div class="summary-value">{reason}</div></div>
+      <div class="summary-card"><div class="summary-label">Emergency restorations</div><div class="summary-value">{elastic_stats}</div></div>
       <div class="summary-card"><div class="summary-label">Termination thresholds</div><div class="summary-value">{solver_thresholds}</div></div>
       <div class="summary-card"><div class="summary-label">Validation thresholds</div><div class="summary-value">{validation_thresholds}</div></div>
     </div>
@@ -101,6 +111,7 @@ fn render_transcript_html(
         status_class = status_class,
         status_text = status_text,
         reason = html_escape(&reason),
+        elastic_stats = html_escape(&elastic_stats),
         solver_thresholds = html_escape(record.solver_thresholds.as_deref().unwrap_or("--")),
         validation_thresholds = html_escape(&record.validation.tolerance),
         transcript = html_escape(transcript),
@@ -120,7 +131,9 @@ fn status_badge(status: RunStatus) -> (&'static str, &'static str) {
 fn transcript_reason(record: &ProblemRunRecord) -> String {
     match record.status {
         RunStatus::Passed => "--".to_string(),
-        RunStatus::ReducedAccuracy | RunStatus::FailedValidation => record.validation.detail.clone(),
+        RunStatus::ReducedAccuracy | RunStatus::FailedValidation => {
+            record.validation.detail.clone()
+        }
         RunStatus::SolveError => record
             .error
             .clone()

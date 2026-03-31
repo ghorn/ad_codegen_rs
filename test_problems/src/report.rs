@@ -20,41 +20,7 @@ pub fn render_markdown_report(results: &RunResults) -> String {
     out.push_str("## Overview\n\n");
     out.push_str(&summary_table(results));
     out.push('\n');
-    out.push_str(&family_summary(results));
-
-    let regressions = collect_records(results, |record| {
-        matches!(record.expected, KnownStatus::KnownPassing)
-            && !record.status.accepted()
-    });
-    if !regressions.is_empty() {
-        out.push_str("\n## Known-Passing Regressions\n\n");
-        out.push_str(&record_table(
-            &regressions,
-            false,
-            true,
-            true,
-            "These are the cases CI should care about most.",
-        ));
-    }
-
-    let unexpected_passes = collect_records(results, |record| {
-        matches!(record.expected, KnownStatus::KnownFailing)
-            && record.status.accepted()
-    });
-    if !unexpected_passes.is_empty() {
-        out.push_str("\n## Unexpected Passes\n\n");
-        out.push_str(&record_table(
-            &unexpected_passes,
-            false,
-            true,
-            true,
-            "These look good and are candidates to promote in the manifest.",
-        ));
-    }
-
-    let failures = collect_records(results, |record| {
-        record.status.failed()
-    });
+    let failures = collect_records(results, |record| record.status.failed());
     if !failures.is_empty() {
         out.push_str("\n## Failure Details\n\n");
         for (family, family_records) in group_by_family(&failures) {
@@ -74,6 +40,35 @@ pub fn render_markdown_report(results: &RunResults) -> String {
             out.push('\n');
         }
     }
+    out.push_str(&family_summary(results));
+
+    let regressions = collect_records(results, |record| {
+        matches!(record.expected, KnownStatus::KnownPassing) && !record.status.accepted()
+    });
+    if !regressions.is_empty() {
+        out.push_str("\n## Known-Passing Regressions\n\n");
+        out.push_str(&record_table(
+            &regressions,
+            false,
+            true,
+            true,
+            "These are the cases CI should care about most.",
+        ));
+    }
+
+    let unexpected_passes = collect_records(results, |record| {
+        matches!(record.expected, KnownStatus::KnownFailing) && record.status.accepted()
+    });
+    if !unexpected_passes.is_empty() {
+        out.push_str("\n## Unexpected Passes\n\n");
+        out.push_str(&record_table(
+            &unexpected_passes,
+            false,
+            true,
+            true,
+            "These look good and are candidates to promote in the manifest.",
+        ));
+    }
 
     out.push_str("\n## Full Matrix\n\n");
     for (family, family_records) in group_by_family(&results.records.iter().collect::<Vec<_>>()) {
@@ -89,26 +84,7 @@ pub fn render_terminal_report(results: &RunResults) -> String {
     out.push_str("Test Problems Summary\n\n");
     out.push_str(&summary_table(results));
     out.push('\n');
-    out.push_str(&family_summary(results));
-
-    let regressions = collect_records(results, |record| {
-        matches!(record.expected, KnownStatus::KnownPassing)
-            && !record.status.accepted()
-    });
-    if !regressions.is_empty() {
-        out.push_str("\nKnown-Passing Regressions\n\n");
-        out.push_str(&record_table(
-            &regressions,
-            true,
-            true,
-            false,
-            "These are the cases CI should care about most.",
-        ));
-    }
-
-    let failures = collect_records(results, |record| {
-        record.status.failed()
-    });
+    let failures = collect_records(results, |record| record.status.failed());
     if !failures.is_empty() {
         out.push_str("\nFailure Details\n\n");
         for (family, family_records) in group_by_family(&failures) {
@@ -127,6 +103,21 @@ pub fn render_terminal_report(results: &RunResults) -> String {
             out.push('\n');
         }
     }
+    out.push_str(&family_summary(results));
+
+    let regressions = collect_records(results, |record| {
+        matches!(record.expected, KnownStatus::KnownPassing) && !record.status.accepted()
+    });
+    if !regressions.is_empty() {
+        out.push_str("\nKnown-Passing Regressions\n\n");
+        out.push_str(&record_table(
+            &regressions,
+            true,
+            true,
+            false,
+            "These are the cases CI should care about most.",
+        ));
+    }
 
     out
 }
@@ -139,34 +130,7 @@ pub fn render_html_report(results: &RunResults) -> String {
     );
     body.push_str("<h2>Overview</h2>\n");
     body.push_str(&summary_html_table(results));
-    body.push_str("<h2>Family Summary</h2>\n");
-    body.push_str(&family_summary_html(results));
-
-    let regressions = collect_records(results, |record| {
-        matches!(record.expected, KnownStatus::KnownPassing)
-            && !record.status.accepted()
-    });
-    if !regressions.is_empty() {
-        body.push_str("<h2>Known-Passing Regressions</h2>\n");
-        body.push_str("<p class=\"tp-note\">These are the cases CI should care about most.</p>\n");
-        body.push_str(&record_html_table(&regressions, false, true));
-    }
-
-    let unexpected_passes = collect_records(results, |record| {
-        matches!(record.expected, KnownStatus::KnownFailing)
-            && record.status.accepted()
-    });
-    if !unexpected_passes.is_empty() {
-        body.push_str("<h2>Unexpected Passes</h2>\n");
-        body.push_str(
-            "<p class=\"tp-note\">These look good and are candidates to promote in the manifest.</p>\n",
-        );
-        body.push_str(&record_html_table(&unexpected_passes, false, true));
-    }
-
-    let failures = collect_records(results, |record| {
-        record.status.failed()
-    });
+    let failures = collect_records(results, |record| record.status.failed());
     if !failures.is_empty() {
         body.push_str("<h2>Failure Details</h2>\n");
         for (family, family_records) in group_by_family(&failures) {
@@ -186,6 +150,28 @@ pub fn render_html_report(results: &RunResults) -> String {
             }
             body.push_str("</ul>\n");
         }
+    }
+    body.push_str("<h2>Family Summary</h2>\n");
+    body.push_str(&family_summary_html(results));
+
+    let regressions = collect_records(results, |record| {
+        matches!(record.expected, KnownStatus::KnownPassing) && !record.status.accepted()
+    });
+    if !regressions.is_empty() {
+        body.push_str("<h2>Known-Passing Regressions</h2>\n");
+        body.push_str("<p class=\"tp-note\">These are the cases CI should care about most.</p>\n");
+        body.push_str(&record_html_table(&regressions, false, true));
+    }
+
+    let unexpected_passes = collect_records(results, |record| {
+        matches!(record.expected, KnownStatus::KnownFailing) && record.status.accepted()
+    });
+    if !unexpected_passes.is_empty() {
+        body.push_str("<h2>Unexpected Passes</h2>\n");
+        body.push_str(
+            "<p class=\"tp-note\">These look good and are candidates to promote in the manifest.</p>\n",
+        );
+        body.push_str(&record_html_table(&unexpected_passes, false, true));
     }
 
     body.push_str("<h2>Full Matrix</h2>\n");
@@ -253,21 +239,25 @@ fn summary_table(results: &RunResults) -> String {
     }
     let rows = grouped
         .into_iter()
-        .map(|((solver, jit_opt), (cases, passed, reduced, not_passed, total_time))| {
-            vec![
-                solver.to_string(),
-                jit_opt.to_string(),
-                cases.to_string(),
-                passed.to_string(),
-                reduced.to_string(),
-                not_passed.to_string(),
-                format!("{:.1}%", percentage(passed, cases)),
-                format_duration(total_time),
-            ]
-        })
+        .map(
+            |((solver, jit_opt), (cases, passed, reduced, not_passed, total_time))| {
+                vec![
+                    solver.to_string(),
+                    jit_opt.to_string(),
+                    cases.to_string(),
+                    passed.to_string(),
+                    reduced.to_string(),
+                    not_passed.to_string(),
+                    format!("{:.1}%", percentage(passed, cases)),
+                    format_duration(total_time),
+                ]
+            },
+        )
         .collect::<Vec<_>>();
     render_text_table(
-        ["Solver", "JIT", "Cases", "Pass", "Reduced", "Fail", "Pass %", "Total"],
+        [
+            "Solver", "JIT", "Cases", "Pass", "Reduced", "Fail", "Pass %", "Total",
+        ],
         &[
             Align::Left,
             Align::Left,
@@ -303,16 +293,23 @@ fn summary_html_table(results: &RunResults) -> String {
 
     let mut out = String::from("<div class=\"tp-overview-grid\">");
     for ((solver, jit_opt), (cases, passed, reduced, failed, total_time)) in grouped {
-        let pass_class = if reduced > 0 || failed > 0 {
-            "tp-warn"
+        let pass_class = "tp-ok";
+        let reduced_class = if reduced == 0 {
+            "tp-neutral"
         } else {
-            "tp-ok"
+            "tp-warn"
         };
-        let reduced_class = if reduced == 0 { "tp-neutral" } else { "tp-warn" };
         let fail_class = if failed == 0 { "tp-neutral" } else { "tp-fail" };
+        let card_class = if failed > 0 {
+            "tp-card-fail"
+        } else if reduced > 0 {
+            "tp-card-warn"
+        } else {
+            "tp-card-ok"
+        };
         let _ = writeln!(
             out,
-            "<div class=\"tp-overview-card\"><div class=\"tp-overview-head\"><span class=\"tp-overview-solver\">{solver}</span><span class=\"tp-overview-jit\">{jit_opt}</span></div><div class=\"tp-overview-body\"><div><span class=\"tp-inline-note\">cases</span> <strong>{cases}</strong></div><div><span class=\"tp-inline-note\">pass</span> <span class=\"tp-badge {pass_class}\">{passed}</span></div><div><span class=\"tp-inline-note\">reduced</span> <span class=\"tp-badge {reduced_class}\">{reduced}</span></div><div><span class=\"tp-inline-note\">fail</span> <span class=\"tp-badge {fail_class}\">{failed}</span></div><div><span class=\"tp-inline-note\">pass %</span> <strong>{:.1}%</strong></div><div><span class=\"tp-inline-note\">total</span> <strong>{}</strong></div></div></div>",
+            "<div class=\"tp-overview-card {card_class}\"><div class=\"tp-overview-head\"><span class=\"tp-overview-solver\">{solver}</span><span class=\"tp-overview-jit\">{jit_opt}</span></div><div class=\"tp-overview-body\"><div class=\"tp-overview-row\"><span class=\"tp-inline-note\">cases</span><strong class=\"tp-overview-value tp-num\">{cases}</strong></div><div class=\"tp-overview-row\"><span class=\"tp-inline-note\">pass</span><span class=\"tp-badge {pass_class}\">{passed}</span></div><div class=\"tp-overview-row\"><span class=\"tp-inline-note\">reduced</span><span class=\"tp-badge {reduced_class}\">{reduced}</span></div><div class=\"tp-overview-row\"><span class=\"tp-inline-note\">fail</span><span class=\"tp-badge {fail_class}\">{failed}</span></div><div class=\"tp-overview-row\"><span class=\"tp-inline-note\">pass %</span><strong class=\"tp-overview-value tp-num\">{:.1}%</strong></div><div class=\"tp-overview-row\"><span class=\"tp-inline-note\">total</span><strong class=\"tp-overview-value tp-num\">{}</strong></div></div></div>",
             percentage(passed, cases),
             format_duration(total_time),
         );
@@ -377,7 +374,7 @@ fn family_summary_html(results: &RunResults) -> String {
         for column in &columns {
             if let Some((cases, passed, reduced, total_time)) = by_column.get(column) {
                 family_total += *total_time;
-                let pass_class = if *passed == *cases && *reduced == 0 {
+                let pass_class = if *passed == *cases {
                     "tp-ok"
                 } else if *passed == 0 {
                     "tp-fail"
@@ -467,6 +464,16 @@ fn format_opt_f64(value: Option<f64>) -> String {
     value.map_or_else(|| "--".to_string(), |value| format!("{value:.3e}"))
 }
 
+fn format_elastic_metrics(record: &ProblemRunRecord) -> String {
+    match (
+        record.metrics.elastic_recovery_activations,
+        record.metrics.elastic_recovery_qp_solves,
+    ) {
+        (Some(activations), Some(recovery_qps)) => format!("{activations}/{recovery_qps}"),
+        _ => "--".to_string(),
+    }
+}
+
 fn format_expected_short(expected: KnownStatus) -> &'static str {
     match expected {
         KnownStatus::KnownPassing => "pass",
@@ -550,6 +557,7 @@ fn record_table(
             record.descriptor.dof.to_string(),
             constraint_summary(record),
             format_opt_usize(record.metrics.iterations),
+            format_elastic_metrics(record),
             format_duration(record.timing.total_wall_time),
             format_opt_f64(record.metrics.objective),
             format_opt_f64(record.metrics.primal_inf),
@@ -571,7 +579,7 @@ fn record_table(
         align.push(Align::Left);
     }
     headers.extend([
-        "Status", "Vars", "DOF", "Constr", "Iters", "Time", "Obj", "Primal", "Dual",
+        "Status", "Vars", "DOF", "Constr", "Iters", "Elastic", "Time", "Obj", "Primal", "Dual",
     ]);
     align.extend([
         Align::Left,
@@ -579,6 +587,7 @@ fn record_table(
         Align::Right,
         Align::Left,
         Align::Right,
+        Align::Left,
         Align::Right,
         Align::Right,
         Align::Right,
@@ -613,7 +622,7 @@ fn record_html_table(
         out.push_str("<th>Exp</th>");
     }
     out.push_str(
-        "<th>Status</th><th>Reason</th><th>Vars</th><th>DOF</th><th>Constr</th><th>Iters</th><th>Time</th><th>Obj</th><th>Primal</th><th>Dual</th>",
+        "<th>Status</th><th>Reason</th><th>Vars</th><th>DOF</th><th>Constr</th><th>Iters</th><th>Elastic</th><th>Time</th><th>Obj</th><th>Primal</th><th>Dual</th>",
     );
     if include_detail {
         out.push_str("<th>Detail</th>");
@@ -640,13 +649,14 @@ fn record_html_table(
         }
         let _ = write!(
             out,
-            "<td>{status_badge}</td><td class=\"{}\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td>{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td>",
+            "<td>{status_badge}</td><td class=\"{}\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td>{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td><td class=\"tp-num\">{}</td>",
             info.cell_class,
             reason_badge(&info),
             record.descriptor.num_vars,
             record.descriptor.dof,
             constraint_summary(record),
             format_opt_usize(record.metrics.iterations),
+            format_elastic_metrics(record),
             format_duration(record.timing.total_wall_time),
             format_opt_f64(record.metrics.objective),
             format_opt_f64(record.metrics.primal_inf),
@@ -815,6 +825,8 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
 fn report_styles() -> &'static str {
     r#"<style>
 body.tp-page { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; background: #0f172a; color: #e2e8f0; line-height: 1.45; }
+a, a:visited { color: #7dd3fc; text-decoration: underline; text-decoration-color: rgba(125, 211, 252, 0.45); text-underline-offset: 2px; }
+a:hover { color: #bae6fd; text-decoration-color: rgba(186, 230, 253, 0.9); }
 h1, h2, h3 { margin: 0 0 12px; }
 h2 { margin-top: 28px; }
 h3 { margin-top: 20px; }
@@ -827,13 +839,18 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; }
 .tp-table th, .tp-table td { border: 1px solid #334155; padding: 6px 8px; text-align: left; vertical-align: top; }
 .tp-table th { background: #172033; color: #bfdbfe; }
 .tp-num { text-align: right; font-variant-numeric: tabular-nums; }
-.tp-badge { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 700; line-height: 1.4; white-space: nowrap; }
-.tp-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, max-content)); gap: 12px; margin: 0 0 16px; align-items: start; }
-.tp-overview-card { background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 12px 14px; }
+.tp-badge { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 700; line-height: 1.4; white-space: nowrap; }
+.tp-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin: 0 0 18px; align-items: start; }
+.tp-overview-card { background: #111827; border: 1px solid #334155; border-radius: 16px; padding: 16px 18px; }
+.tp-card-ok { border-color: rgba(52, 211, 153, 0.28); }
+.tp-card-warn { border-color: rgba(251, 191, 36, 0.28); }
+.tp-card-fail { border-color: rgba(248, 113, 113, 0.28); }
 .tp-overview-head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.tp-overview-solver { font-weight: 700; color: #e2e8f0; text-transform: lowercase; }
-.tp-overview-jit { color: #93c5fd; font-family: ui-monospace, SFMono-Regular, monospace; }
-.tp-overview-body { display: grid; grid-template-columns: auto auto; gap: 6px 10px; align-items: center; }
+.tp-overview-solver { font-weight: 800; font-size: 1.15rem; color: #e2e8f0; text-transform: lowercase; }
+.tp-overview-jit { color: #93c5fd; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 1.05rem; }
+.tp-overview-body { display: grid; grid-template-columns: 1fr; gap: 9px; }
+.tp-overview-row { display: grid; grid-template-columns: 1fr auto; align-items: center; column-gap: 16px; }
+.tp-overview-value { justify-self: end; font-variant-numeric: tabular-nums; }
 .tp-ok { background: #dcfce7; color: #166534; }
 .tp-fail { background: #fee2e2; color: #991b1b; }
 .tp-warn { background: #fef3c7; color: #92400e; }

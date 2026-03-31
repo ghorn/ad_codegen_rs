@@ -44,8 +44,8 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       background: var(--bg);
       color: var(--text);
     }}
-    a {{ color: #93c5fd; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
+    a, a:visited {{ color: #7dd3fc; text-decoration: underline; text-decoration-color: rgba(125, 211, 252, 0.45); text-underline-offset: 2px; }}
+    a:hover {{ color: #bae6fd; text-decoration-color: rgba(186, 230, 253, 0.9); }}
     .page {{
       max-width: 1680px;
       margin: 0 auto;
@@ -486,6 +486,13 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       }}
     }};
 
+    const elasticText = (record) => {{
+      const activations = record.metrics.elastic_recovery_activations;
+      const recoveryQps = record.metrics.elastic_recovery_qp_solves;
+      if (activations == null || recoveryQps == null) return "--";
+      return `${{activations}}/${{recoveryQps}}`;
+    }};
+
     const failureCode = (record) => {{
       const text = failureReason(record).toLowerCase();
       if (record.status === "passed") return "--";
@@ -512,6 +519,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
         `${{xLabel}}: ${{xValue.toFixed(3)}}`,
         `${{yLabel}}: ${{yValue.toFixed(3)}}`,
         `iters: ${{intText(record.metrics.iterations)}}`,
+        `elastic: ${{elasticText(record)}}`,
         `total: ${{formatDuration(record.timing.total_wall_time)}}`,
         `objective: ${{numberText(record.metrics.objective)}}`,
         `primal: ${{numberText(record.metrics.primal_inf)}}`,
@@ -689,7 +697,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
       const html = `
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Problem</th><th>Solver</th><th>Status</th><th>Iters</th><th>Total</th><th>Reason</th></tr></thead>
+            <thead><tr><th>Problem</th><th>Solver</th><th>Status</th><th>Iters</th><th>Elastic</th><th>Total</th><th>Reason</th></tr></thead>
             <tbody>
               ${{rows.map((record) => `
                 <tr>
@@ -697,6 +705,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                   <td class="solver-${{record.solver}}">${{solverLabel(record.solver)}} / ${{record.options.jit_opt_level.toUpperCase()}}</td>
                   <td><span class="pill ${{statusClass(record.status)}}">${{htmlEscape(statusLabel(record.status))}}</span></td>
                   <td>${{intText(record.metrics.iterations)}}</td>
+                  <td>${{htmlEscape(elasticText(record))}}</td>
                   <td>${{formatDuration(record.timing.total_wall_time)}}</td>
                   <td>${{htmlEscape(failureCode(record))}}</td>
                 </tr>`).join('')}}
@@ -812,6 +821,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                 <th>DOF</th>
                 <th>Constr</th>
                 <th>Iters</th>
+                <th>Elastic</th>
                 <th>Total</th>
                 <th>Reason</th>
               </tr>
@@ -829,6 +839,7 @@ fn render_dashboard(results: &RunResults) -> Result<String> {
                   <td>${{record.descriptor.dof}}</td>
                   <td>${{htmlEscape(constraintLabel(record))}}</td>
                   <td>${{intText(record.metrics.iterations)}}</td>
+                  <td>${{htmlEscape(elasticText(record))}}</td>
                   <td>${{formatDuration(record.timing.total_wall_time)}}</td>
                   <td>${{htmlEscape(failureCode(record))}}</td>
                 </tr>`).join('')}}

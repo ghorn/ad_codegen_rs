@@ -1,4 +1,6 @@
 use approx::assert_abs_diff_eq;
+#[cfg(feature = "ipopt")]
+use optimization::IpoptOptions;
 use optimization::{ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, symbolic_nlp};
 use sx_core::SX;
 
@@ -213,4 +215,75 @@ fn typed_symbolic_compile_exposes_timing_metadata() {
     assert!(timing.function_creation_time.is_some());
     assert!(timing.derivative_generation_time.is_some());
     assert!(timing.jit_time.is_some());
+}
+
+#[cfg(feature = "ipopt")]
+#[test]
+fn typed_symbolic_rosenbrock_solves_with_ipopt_without_box_bounds() {
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, (), (), _>("rosenbrock_ipopt", |x, _| SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            constraints: (),
+        })
+        .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let summary = compiled
+        .solve_ipopt(
+            &Pair { x: -1.2, y: 1.0 },
+            &(),
+            &TypedRuntimeNlpBounds::default(),
+            &IpoptOptions {
+                max_iters: 120,
+                tol: 1e-9,
+                ..IpoptOptions::default()
+            },
+        )
+        .expect("Ipopt solve should succeed");
+
+    assert_abs_diff_eq!(summary.x[0], 1.0, epsilon = 1e-6);
+    assert_abs_diff_eq!(summary.x[1], 1.0, epsilon = 1e-6);
+    assert!(summary.objective <= 1e-10);
+    assert!(summary.dual_inf_norm <= 1e-6);
+}
+
+#[cfg(feature = "ipopt")]
+#[test]
+fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds() {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), Pair<SX>, _>("disk_rosenbrock_ipopt", |x, _| {
+        SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            constraints: Pair {
+                x: x.x.sqr() + x.y.sqr(),
+                y: x.y,
+            },
+        }
+    })
+    .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let summary = compiled
+        .solve_ipopt(
+            &Pair { x: -1.2, y: 1.0 },
+            &(),
+            &TypedRuntimeNlpBounds {
+                variable_lower: None,
+                variable_upper: None,
+                constraint_lower: Some(Pair {
+                    x: -f64::INFINITY,
+                    y: -f64::INFINITY,
+                }),
+                constraint_upper: Some(Pair { x: 1.5, y: 2.0 }),
+            },
+            &IpoptOptions {
+                max_iters: 200,
+                tol: 1e-9,
+                ..IpoptOptions::default()
+            },
+        )
+        .expect("Ipopt solve should succeed");
+
+    assert!(summary.primal_inf_norm <= 1e-7);
+    assert!(summary.dual_inf_norm <= 1e-6);
+    assert!(summary.complementarity_inf_norm <= 1e-6);
+    assert!(summary.objective < 10.0);
+    assert!(summary.x[0].powi(2) + summary.x[1].powi(2) <= 1.5 + 1e-5);
 }

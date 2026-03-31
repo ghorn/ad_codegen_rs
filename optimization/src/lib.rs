@@ -23,12 +23,12 @@ pub use interior_point::{
     solve_nlp_interior_point_with_callback,
 };
 #[cfg(feature = "ipopt")]
+pub use ipopt::SolveStatus as IpoptSolveStatus;
+#[cfg(feature = "ipopt")]
 pub use ipopt_backend::{
     IpoptIterationPhase, IpoptIterationSnapshot, IpoptMuStrategy, IpoptOptions, IpoptSolveError,
     IpoptSummary, solve_nlp_ipopt,
 };
-#[cfg(feature = "ipopt")]
-pub use ipopt::SolveStatus as IpoptSolveStatus;
 pub use optimization_derive::Vectorize;
 pub use symbolic::{
     ConstraintBounds, RuntimeBoundedJitNlp, RuntimeNlpBounds, SymbolicNlpBuildError,
@@ -74,6 +74,8 @@ pub struct ClarabelSqpProfiling {
     pub qp_setup_time: Duration,
     pub qp_solves: Index,
     pub qp_solve_time: Duration,
+    pub elastic_recovery_activations: Index,
+    pub elastic_recovery_qp_solves: Index,
     pub preprocessing_time: Duration,
     pub total_time: Duration,
     pub unaccounted_time: Duration,
@@ -1321,6 +1323,14 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
         ),
     ));
     lines.push(boxed_line(
+        "elastic",
+        format!(
+            "activations={:>4}  recovery_qps={:>4}",
+            summary.profiling.elastic_recovery_activations,
+            summary.profiling.elastic_recovery_qp_solves,
+        ),
+    ));
+    lines.push(boxed_line(
         "",
         timing_row("preprocess", None, summary.profiling.preprocessing_time),
     ));
@@ -1569,7 +1579,7 @@ fn log_sqp_iteration(
     options: &ClarabelSqpOptions,
     event_state: &mut SqpEventLegendState,
 ) {
-    if snapshot.iteration.is_multiple_of(20) {
+    if snapshot.iteration.is_multiple_of(10) {
         eprintln!();
         let header = [
             format!("{:>4}", "iter"),
@@ -1837,8 +1847,7 @@ fn decode_elastic_qp_solution(
     cursor += equality_count;
     let equality_lower = &raw.dual[cursor..cursor + equality_count];
     cursor += equality_count;
-    let inequality_multipliers =
-        raw.dual[cursor..cursor + nonlinear_inequality_count].to_vec();
+    let inequality_multipliers = raw.dual[cursor..cursor + nonlinear_inequality_count].to_vec();
     cursor += nonlinear_inequality_count;
     let augmented_bound_multipliers = &raw.dual[cursor..];
     let (lower_bound_multipliers, upper_bound_multipliers) =
@@ -1962,14 +1971,16 @@ fn solve_elastic_recovery_qp(
         cones.push(NonnegativeConeT(nonlinear_inequality_count));
     }
 
-    solve_clarabel_qp_from_dense(
+    let solve = solve_clarabel_qp_from_dense(
         &elastic_hessian,
         &linear_objective,
         &constraint_matrix,
         &rhs,
         &cones,
         qp_ctx,
-    )
+    )?;
+    qp_ctx.profiling.elastic_recovery_qp_solves += 1;
+    Ok(solve)
 }
 
 pub fn solve_nlp_sqp<P>(
@@ -2328,13 +2339,15 @@ where
             if elastic_mode_active {
                 let elastic_qp = solve_elastic_recovery_qp(&elastic_model, options, &mut qp_ctx)?;
                 match elastic_qp.qp_info.raw_status {
-                    SolverStatus::Solved | SolverStatus::AlmostSolved => decode_elastic_qp_solution(
-                        elastic_qp,
-                        n,
-                        equality_count,
-                        inequality_count,
-                        lower_bound_count,
-                    ),
+                    SolverStatus::Solved | SolverStatus::AlmostSolved => {
+                        decode_elastic_qp_solution(
+                            elastic_qp,
+                            n,
+                            equality_count,
+                            inequality_count,
+                            lower_bound_count,
+                        )
+                    }
                     status => {
                         return Err(ClarabelSqpError::QpSolve {
                             status,
@@ -2372,6 +2385,7 @@ where
                         ) =>
                     {
                         activated_elastic_mode = true;
+                        qp_ctx.profiling.elastic_recovery_activations += 1;
                         let elastic_qp =
                             solve_elastic_recovery_qp(&elastic_model, options, &mut qp_ctx)?;
                         match elastic_qp.qp_info.raw_status {
