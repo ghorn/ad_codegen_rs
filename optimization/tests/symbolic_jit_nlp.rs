@@ -23,9 +23,10 @@ struct Chain<T, const N: usize> {
 
 #[test]
 fn typed_symbolic_rosenbrock_solves_end_to_end_with_jit() {
-    let symbolic = symbolic_nlp::<Pair<SX>, (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
         objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-        constraints: (),
+        equalities: (),
+        inequalities: (),
     })
     .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
@@ -58,9 +59,10 @@ fn typed_symbolic_rosenbrock_solves_end_to_end_with_jit() {
 #[test]
 fn typed_symbolic_disk_constrained_rosenbrock_solves_with_runtime_constraint_bounds() {
     let symbolic =
-        symbolic_nlp::<Pair<SX>, (), Pair<SX>, _>("disk_rosenbrock", |x, _| SymbolicNlpOutputs {
+        symbolic_nlp::<Pair<SX>, (), (), Pair<SX>, _>("disk_rosenbrock", |x, _| SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-            constraints: Pair {
+            equalities: (),
+            inequalities: Pair {
                 x: x.x.sqr() + x.y.sqr(),
                 y: x.y,
             },
@@ -74,11 +76,11 @@ fn typed_symbolic_disk_constrained_rosenbrock_solves_with_runtime_constraint_bou
             &TypedRuntimeNlpBounds {
                 variable_lower: None,
                 variable_upper: None,
-                constraint_lower: Some(Pair {
+                inequality_lower: Some(Pair {
                     x: -f64::INFINITY,
                     y: -f64::INFINITY,
                 }),
-                constraint_upper: Some(Pair { x: 1.5, y: 2.0 }),
+                inequality_upper: Some(Pair { x: 1.5, y: 2.0 }),
             },
             &ClarabelSqpOptions {
                 max_iters: 80,
@@ -105,7 +107,7 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
     const N: usize = 4;
     let span = 3.0;
     let link_length = 0.75;
-    let symbolic = symbolic_nlp::<Chain<SX, N>, (), [SX; N + 1], _>("hanging_chain", |q, _| {
+    let symbolic = symbolic_nlp::<Chain<SX, N>, (), [SX; N + 1], (), _>("hanging_chain", |q, _| {
         let objective = q.points.iter().fold(SX::zero(), |acc, point| acc + point.y);
         let mut constraints = std::array::from_fn(|_| SX::zero());
         let mut prev_x = SX::from(0.0);
@@ -120,7 +122,8 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
         constraints[N] = (prev_x - span).sqr() + prev_y.sqr() - link_length_sq;
         SymbolicNlpOutputs {
             objective,
-            constraints,
+            equalities: constraints,
+            inequalities: (),
         }
     })
     .expect("symbolic NLP should build");
@@ -145,8 +148,8 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
             &TypedRuntimeNlpBounds {
                 variable_lower: None,
                 variable_upper: None,
-                constraint_lower: Some(std::array::from_fn(|_| 0.0)),
-                constraint_upper: Some(std::array::from_fn(|_| 0.0)),
+                inequality_lower: None,
+                inequality_upper: None,
             },
             &ClarabelSqpOptions {
                 max_iters: 120,
@@ -170,10 +173,11 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
 
 #[test]
 fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
-    let symbolic = symbolic_nlp::<Pair<SX>, Pair<SX>, SX, _>("parameterized_quadratic", |x, p| {
+    let symbolic = symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>("parameterized_quadratic", |x, p| {
         SymbolicNlpOutputs {
             objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
-            constraints: x.x + x.y,
+            equalities: x.x + x.y,
+            inequalities: (),
         }
     })
     .expect("symbolic NLP should build");
@@ -185,8 +189,8 @@ fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
             &TypedRuntimeNlpBounds {
                 variable_lower: None,
                 variable_upper: None,
-                constraint_lower: Some(1.0),
-                constraint_upper: Some(1.0),
+                inequality_lower: None,
+                inequality_upper: None,
             },
             &ClarabelSqpOptions {
                 verbose: false,
@@ -195,18 +199,19 @@ fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
         )
         .expect("SQP solve should succeed");
 
-    assert_abs_diff_eq!(summary.x[0], 0.25, epsilon = 1e-6);
-    assert_abs_diff_eq!(summary.x[1], 0.75, epsilon = 1e-6);
-    assert_abs_diff_eq!(summary.objective, 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(summary.x[0], -0.25, epsilon = 1e-6);
+    assert_abs_diff_eq!(summary.x[1], 0.25, epsilon = 1e-6);
+    assert_abs_diff_eq!(summary.objective, 0.5, epsilon = 1e-9);
     assert!(summary.equality_inf_norm.is_some_and(|value| value <= 1e-8));
 }
 
 #[test]
 fn typed_symbolic_compile_exposes_timing_metadata() {
     let symbolic =
-        symbolic_nlp::<Pair<SX>, (), (), _>("timed_rosenbrock", |x, _| SymbolicNlpOutputs {
+        symbolic_nlp::<Pair<SX>, (), (), (), _>("timed_rosenbrock", |x, _| SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-            constraints: (),
+            equalities: (),
+            inequalities: (),
         })
         .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
@@ -221,9 +226,10 @@ fn typed_symbolic_compile_exposes_timing_metadata() {
 #[test]
 fn typed_symbolic_rosenbrock_solves_with_ipopt_without_box_bounds() {
     let symbolic =
-        symbolic_nlp::<Pair<SX>, (), (), _>("rosenbrock_ipopt", |x, _| SymbolicNlpOutputs {
+        symbolic_nlp::<Pair<SX>, (), (), (), _>("rosenbrock_ipopt", |x, _| SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-            constraints: (),
+            equalities: (),
+            inequalities: (),
         })
         .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
@@ -249,10 +255,11 @@ fn typed_symbolic_rosenbrock_solves_with_ipopt_without_box_bounds() {
 #[cfg(feature = "ipopt")]
 #[test]
 fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds() {
-    let symbolic = symbolic_nlp::<Pair<SX>, (), Pair<SX>, _>("disk_rosenbrock_ipopt", |x, _| {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), (), Pair<SX>, _>("disk_rosenbrock_ipopt", |x, _| {
         SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-            constraints: Pair {
+            equalities: (),
+            inequalities: Pair {
                 x: x.x.sqr() + x.y.sqr(),
                 y: x.y,
             },
@@ -267,11 +274,11 @@ fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds()
             &TypedRuntimeNlpBounds {
                 variable_lower: None,
                 variable_upper: None,
-                constraint_lower: Some(Pair {
+                inequality_lower: Some(Pair {
                     x: -f64::INFINITY,
                     y: -f64::INFINITY,
                 }),
-                constraint_upper: Some(Pair { x: 1.5, y: 2.0 }),
+                inequality_upper: Some(Pair { x: 1.5, y: 2.0 }),
             },
             &IpoptOptions {
                 max_iters: 200,

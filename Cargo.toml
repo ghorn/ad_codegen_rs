@@ -28,6 +28,7 @@ clarabel = "0.11.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 llvm-sys = { version = "221.0.0", features = ["prefer-dynamic", "strict-versioning"] }
 nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
+libc = "0.2.172"
 proptest = "1.7.0"
 rstest = "0.25.0"
 serde = { version = "1.0.219", features = ["derive"] }

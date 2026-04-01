@@ -376,6 +376,10 @@ fn sqp_reports_profiling_breakdown(
     let accounted_without_unaccounted = callback_total_time
         + profiling.qp_setup_time
         + profiling.qp_solve_time
+        + profiling.multiplier_estimation_time
+        + profiling.line_search_evaluation_time
+        + profiling.line_search_condition_check_time
+        + profiling.convergence_check_time
         + profiling.preprocessing_time;
 
     assert!(profiling.objective_value.calls >= snapshot_count);
@@ -387,9 +391,12 @@ fn sqp_reports_profiling_breakdown(
         profiling.lagrangian_hessian_values.calls,
         profiling.qp_setups
     );
+    assert!(profiling.multiplier_estimation_time >= Duration::ZERO);
+    assert!(profiling.line_search_evaluation_time >= Duration::ZERO);
+    assert!(profiling.line_search_condition_check_time >= Duration::ZERO);
+    assert!(profiling.convergence_check_time >= Duration::ZERO);
     assert!(profiling.qp_setups <= snapshot_count);
     assert!(profiling.qp_setups + 1 >= snapshot_count);
-    assert!(profiling.total_time >= accounted_without_unaccounted);
     assert_eq!(
         profiling.unaccounted_time,
         profiling

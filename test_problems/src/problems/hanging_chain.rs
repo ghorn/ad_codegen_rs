@@ -1,4 +1,4 @@
-use optimization::{SymbolicNlpOutputs, TypedRuntimeNlpBounds};
+use optimization::{SymbolicNlpOutputs, TypedRuntimeNlpBounds, Vectorize};
 use sx_core::SX;
 
 use crate::model::{ProblemRunRecord, ValidationOutcome, ValidationTier};
@@ -182,51 +182,79 @@ fn case_for<const N: usize, const LINKS: usize>(
     initial_condition: InitialCondition,
     constraint_mode: ConstraintMode,
 ) -> ProblemCase {
-    make_typed_case::<Chain<SX, N>, (), VecN<SX, LINKS>, _, _>(
-        CaseMetadata::new(
-            id,
-            "hanging_chain",
-            variant,
-            "manual",
-            "Parameterized hanging chain with runtime equality/inequality link bounds and configurable initial condition",
-            true,
+    let metadata = CaseMetadata::new(
+        id,
+        "hanging_chain",
+        variant,
+        "manual",
+        "Parameterized hanging chain with runtime equality/inequality link bounds and configurable initial condition",
+        true,
+    );
+    match constraint_mode {
+        ConstraintMode::Equality => make_typed_case::<Chain<SX, N>, (), VecN<SX, LINKS>, (), _, _>(
+            metadata,
+            move |jit_opt_level| {
+                let spec = HangingChainSpec::for_links(LINKS);
+                let compiled = symbolic_compile::<Chain<SX, N>, (), VecN<SX, LINKS>, (), _>(
+                    id,
+                    |q, ()| {
+                        let objective = hanging_chain_objective(q);
+                        let constraints = hanging_chain_constraints::<N, LINKS>(q, spec);
+                        SymbolicNlpOutputs {
+                            objective,
+                            equalities: constraints,
+                            inequalities: (),
+                        }
+                    },
+                    jit_opt_level,
+                )?;
+                Ok(super::TypedProblemData {
+                    compiled,
+                    x0: initial_guess::<N, LINKS>(spec, initial_condition),
+                    parameters: (),
+                    bounds: TypedRuntimeNlpBounds::default(),
+                })
+            },
+            move |record| validate_hanging_chain::<N, LINKS>(record, constraint_mode),
         ),
-        move |jit_opt_level| {
-            let spec = HangingChainSpec::for_links(LINKS);
-            let compiled = symbolic_compile::<Chain<SX, N>, (), VecN<SX, LINKS>, _>(
-                id,
-                |q, ()| {
-                    let mut objective = SX::zero();
-                    for point in &q.points {
-                        objective += point.y;
-                    }
-                    let constraints = VecN {
-                        values: std::array::from_fn(|idx| {
-                            distance_constraint::<N>(
-                                q,
-                                idx,
-                                spec.anchor_left,
-                                spec.anchor_right,
-                                spec.link_length_sq,
-                            )
-                        }),
-                    };
-                    SymbolicNlpOutputs {
-                        objective,
-                        constraints,
-                    }
-                },
-                jit_opt_level,
-            )?;
-            Ok(super::TypedProblemData {
-                compiled,
-                x0: initial_guess::<N, LINKS>(spec, initial_condition),
-                parameters: (),
-                bounds: bounds_for::<Chain<SX, N>, VecN<SX, LINKS>>(constraint_mode),
-            })
-        },
-        move |record| validate_hanging_chain::<N, LINKS>(record, constraint_mode),
-    )
+        ConstraintMode::Inequality => make_typed_case::<Chain<SX, N>, (), (), VecN<SX, LINKS>, _, _>(
+            metadata,
+            move |jit_opt_level| {
+                let spec = HangingChainSpec::for_links(LINKS);
+                let compiled = symbolic_compile::<Chain<SX, N>, (), (), VecN<SX, LINKS>, _>(
+                    id,
+                    |q, ()| {
+                        let objective = hanging_chain_objective(q);
+                        let constraints = hanging_chain_constraints::<N, LINKS>(q, spec);
+                        SymbolicNlpOutputs {
+                            objective,
+                            equalities: (),
+                            inequalities: constraints,
+                        }
+                    },
+                    jit_opt_level,
+                )?;
+                Ok(super::TypedProblemData {
+                    compiled,
+                    x0: initial_guess::<N, LINKS>(spec, initial_condition),
+                    parameters: (),
+                    bounds: TypedRuntimeNlpBounds {
+                        variable_lower: None,
+                        variable_upper: None,
+                        inequality_lower: Some(
+                            <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(
+                                &mut || f64::NEG_INFINITY,
+                            ),
+                        ),
+                        inequality_upper: Some(
+                            <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || 0.0),
+                        ),
+                    },
+                })
+            },
+            move |record| validate_hanging_chain::<N, LINKS>(record, constraint_mode),
+        ),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,24 +278,24 @@ impl HangingChainSpec {
     }
 }
 
-fn bounds_for<X, C>(mode: ConstraintMode) -> TypedRuntimeNlpBounds<X, C>
-where
-    X: optimization::Vectorize<SX>,
-    C: optimization::Vectorize<SX>,
-{
-    match mode {
-        ConstraintMode::Equality => TypedRuntimeNlpBounds {
-            variable_lower: None,
-            variable_upper: None,
-            constraint_lower: Some(C::from_flat_fn(&mut || 0.0)),
-            constraint_upper: Some(C::from_flat_fn(&mut || 0.0)),
-        },
-        ConstraintMode::Inequality => TypedRuntimeNlpBounds {
-            variable_lower: None,
-            variable_upper: None,
-            constraint_lower: Some(C::from_flat_fn(&mut || f64::NEG_INFINITY)),
-            constraint_upper: Some(C::from_flat_fn(&mut || 0.0)),
-        },
+fn hanging_chain_objective<const N: usize>(q: &Chain<SX, N>) -> SX {
+    q.points.iter().fold(SX::zero(), |acc, point| acc + point.y)
+}
+
+fn hanging_chain_constraints<const N: usize, const LINKS: usize>(
+    q: &Chain<SX, N>,
+    spec: HangingChainSpec,
+) -> VecN<SX, LINKS> {
+    VecN {
+        values: std::array::from_fn(|idx| {
+            distance_constraint::<N>(
+                q,
+                idx,
+                spec.anchor_left,
+                spec.anchor_right,
+                spec.link_length_sq,
+            )
+        }),
     }
 }
 

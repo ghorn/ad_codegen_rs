@@ -23,66 +23,71 @@ struct SymbolicNlp {
     variables: SXMatrix,
     parameters: Vec<NamedMatrix>,
     objective: SXMatrix,
-    constraints: Option<SXMatrix>,
+    equalities: Option<SXMatrix>,
+    inequalities: Option<SXMatrix>,
     construction_time: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SymbolicNlpOutputs<C> {
+pub struct SymbolicNlpOutputs<E = (), I = ()> {
     pub objective: SX,
-    pub constraints: C,
+    pub equalities: E,
+    pub inequalities: I,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TypedSymbolicNlp<X, P, C> {
+pub struct TypedSymbolicNlp<X, P, E, I> {
     symbolic: SymbolicNlp,
-    _marker: TypedMarker<X, P, C>,
+    _marker: TypedMarker<X, P, E, I>,
 }
 
 #[derive(Debug)]
 struct CompiledJitNlp {
     dimension: Index,
     parameter_ccs: Vec<CCS>,
-    constraint_jacobian_ccs: CCS,
+    equality_jacobian_ccs: CCS,
+    inequality_base_jacobian_ccs: CCS,
     lagrangian_hessian_ccs: CCS,
     backend_timing: BackendTimingMetadata,
     objective_value: JitKernel,
     objective_gradient: JitKernel,
-    constraint_values: Option<JitKernel>,
-    constraint_jacobian_values: Option<JitKernel>,
+    equality_values: Option<JitKernel>,
+    equality_jacobian_values: Option<JitKernel>,
+    inequality_values: Option<JitKernel>,
+    inequality_jacobian_values: Option<JitKernel>,
     lagrangian_hessian_values: JitKernel,
 }
 
 #[derive(Debug)]
-pub struct TypedCompiledJitNlp<X, P, C> {
+pub struct TypedCompiledJitNlp<X, P, E, I> {
     inner: CompiledJitNlp,
-    _marker: TypedMarker<X, P, C>,
+    _marker: TypedMarker<X, P, E, I>,
 }
 
-type TypedMarker<X, P, C> = PhantomData<fn() -> (X, P, C)>;
+type TypedMarker<X, P, E, I> = PhantomData<fn() -> (X, P, E, I)>;
 
-pub struct TypedRuntimeNlpBounds<X, C>
+pub struct TypedRuntimeNlpBounds<X, I>
 where
     X: Vectorize<SX>,
-    C: Vectorize<SX>,
+    I: Vectorize<SX>,
 {
     pub variable_lower: Option<<X as Vectorize<SX>>::Rebind<f64>>,
     pub variable_upper: Option<<X as Vectorize<SX>>::Rebind<f64>>,
-    pub constraint_lower: Option<<C as Vectorize<SX>>::Rebind<f64>>,
-    pub constraint_upper: Option<<C as Vectorize<SX>>::Rebind<f64>>,
+    pub inequality_lower: Option<<I as Vectorize<SX>>::Rebind<f64>>,
+    pub inequality_upper: Option<<I as Vectorize<SX>>::Rebind<f64>>,
 }
 
-impl<X, C> Default for TypedRuntimeNlpBounds<X, C>
+impl<X, I> Default for TypedRuntimeNlpBounds<X, I>
 where
     X: Vectorize<SX>,
-    C: Vectorize<SX>,
+    I: Vectorize<SX>,
 {
     fn default() -> Self {
         Self {
             variable_lower: None,
             variable_upper: None,
-            constraint_lower: None,
-            constraint_upper: None,
+            inequality_lower: None,
+            inequality_upper: None,
         }
     }
 }
@@ -96,14 +101,14 @@ pub struct ConstraintBounds {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeNlpBounds {
     pub variables: ConstraintBounds,
-    pub constraints: ConstraintBounds,
+    pub inequalities: ConstraintBounds,
 }
 
 #[derive(Debug)]
 pub struct RuntimeBoundedJitNlp<'a> {
     base: &'a CompiledJitNlp,
     variable_bounds: ConstraintBounds,
-    mapping: ConstraintMapping,
+    inequality_mapping: InequalityMapping,
 }
 
 #[derive(Debug)]
@@ -113,12 +118,9 @@ struct JitKernel {
 }
 
 #[derive(Clone, Debug)]
-struct ConstraintMapping {
-    equality_rows: Vec<ConstraintTransform>,
-    inequality_rows: Vec<ConstraintTransform>,
-    equality_jacobian_ccs: CCS,
+struct InequalityMapping {
+    rows: Vec<ConstraintTransform>,
     inequality_jacobian_ccs: CCS,
-    equality_value_map: Vec<JacobianValueMap>,
     inequality_value_map: Vec<JacobianValueMap>,
 }
 
@@ -191,7 +193,8 @@ impl SymbolicNlp {
         variables: SXMatrix,
         parameters: Vec<NamedMatrix>,
         objective: SXMatrix,
-        constraints: Option<SXMatrix>,
+        equalities: Option<SXMatrix>,
+        inequalities: Option<SXMatrix>,
     ) -> Result<Self, SymbolicNlpBuildError> {
         let name = name.into();
         if name.trim().is_empty() {
@@ -206,12 +209,21 @@ impl SymbolicNlp {
         debug_assert_eq!(objective_function.n_in(), parameters.len() + 1);
         let _ = objective.scalar_expr()?;
 
-        let constraints = normalize_optional_matrix(constraints);
-        if let Some(constraints) = &constraints {
+        let equalities = normalize_optional_matrix(equalities);
+        if let Some(equalities) = &equalities {
             let validation = SXFunction::new(
-                format!("{name}_constraints_validation"),
+                format!("{name}_equalities_validation"),
                 symbolic_inputs(&variables, &parameters)?,
-                vec![NamedMatrix::new("constraints", constraints.clone())?],
+                vec![NamedMatrix::new("equalities", equalities.clone())?],
+            )?;
+            debug_assert_eq!(validation.n_in(), parameters.len() + 1);
+        }
+        let inequalities = normalize_optional_matrix(inequalities);
+        if let Some(inequalities) = &inequalities {
+            let validation = SXFunction::new(
+                format!("{name}_inequalities_validation"),
+                symbolic_inputs(&variables, &parameters)?,
+                vec![NamedMatrix::new("inequalities", inequalities.clone())?],
             )?;
             debug_assert_eq!(validation.n_in(), parameters.len() + 1);
         }
@@ -221,26 +233,28 @@ impl SymbolicNlp {
             variables,
             parameters,
             objective,
-            constraints,
+            equalities,
+            inequalities,
             construction_time: None,
         })
     }
 }
 
-impl<X, P, C> TypedSymbolicNlp<X, P, C>
+impl<X, P, E, I> TypedSymbolicNlp<X, P, E, I>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
 {
-    pub fn compile_jit(&self) -> Result<TypedCompiledJitNlp<X, P, C>, SymbolicNlpCompileError> {
+    pub fn compile_jit(&self) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
         self.compile_jit_with_opt_level(LlvmOptimizationLevel::O3)
     }
 
     pub fn compile_jit_with_opt_level(
         &self,
         opt_level: LlvmOptimizationLevel,
-    ) -> Result<TypedCompiledJitNlp<X, P, C>, SymbolicNlpCompileError> {
+    ) -> Result<TypedCompiledJitNlp<X, P, E, I>, SymbolicNlpCompileError> {
         Ok(TypedCompiledJitNlp {
             inner: compile_symbolic_nlp(&self.symbolic, opt_level)?,
             _marker: PhantomData,
@@ -248,15 +262,16 @@ where
     }
 }
 
-pub fn symbolic_nlp<X, P, C, F>(
+pub fn symbolic_nlp<X, P, E, I, F>(
     name: impl Into<String>,
     model: F,
-) -> Result<TypedSymbolicNlp<X, P, C>, SymbolicNlpBuildError>
+) -> Result<TypedSymbolicNlp<X, P, E, I>, SymbolicNlpBuildError>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
-    F: FnOnce(&X, &P) -> SymbolicNlpOutputs<C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
+    F: FnOnce(&X, &P) -> SymbolicNlpOutputs<E, I>,
 {
     let started_at = Instant::now();
     let name = name.into();
@@ -274,17 +289,19 @@ where
     } else {
         vec![NamedMatrix::new("p", symbolic_column(&parameters)?)?]
     };
-    let constraints = if C::LEN == 0 {
-        None
-    } else {
-        Some(symbolic_column(&outputs.constraints)?)
-    };
+    let equalities = (E::LEN > 0)
+        .then(|| symbolic_column(&outputs.equalities))
+        .transpose()?;
+    let inequalities = (I::LEN > 0)
+        .then(|| symbolic_column(&outputs.inequalities))
+        .transpose()?;
     let mut symbolic = SymbolicNlp::new(
         name,
         variable_matrix,
         parameter_matrices,
         SXMatrix::scalar(outputs.objective),
-        constraints,
+        equalities,
+        inequalities,
     )?;
     symbolic.construction_time = Some(started_at.elapsed());
     Ok(TypedSymbolicNlp {
@@ -305,13 +322,23 @@ impl CompiledJitNlp {
         let jit_started = Instant::now();
         let objective_value = JitKernel::compile(&functions.objective_value, opt_level)?;
         let objective_gradient = JitKernel::compile(&functions.objective_gradient, opt_level)?;
-        let constraint_values = functions
-            .constraint_values
+        let equality_values = functions
+            .equality_values
             .as_ref()
             .map(|function| JitKernel::compile(function, opt_level))
             .transpose()?;
-        let constraint_jacobian_values = functions
-            .constraint_jacobian_values
+        let equality_jacobian_values = functions
+            .equality_jacobian_values
+            .as_ref()
+            .map(|function| JitKernel::compile(function, opt_level))
+            .transpose()?;
+        let inequality_values = functions
+            .inequality_values
+            .as_ref()
+            .map(|function| JitKernel::compile(function, opt_level))
+            .transpose()?;
+        let inequality_jacobian_values = functions
+            .inequality_jacobian_values
             .as_ref()
             .map(|function| JitKernel::compile(function, opt_level))
             .transpose()?;
@@ -326,7 +353,11 @@ impl CompiledJitNlp {
                 .iter()
                 .map(|parameter| ccs_from_core(parameter.matrix().ccs()))
                 .collect(),
-            constraint_jacobian_ccs: functions.constraint_jacobian_values.as_ref().map_or_else(
+            equality_jacobian_ccs: functions.equality_jacobian_values.as_ref().map_or_else(
+                || CCS::empty(0, symbolic.variables.nnz()),
+                function_output_ccs,
+            ),
+            inequality_base_jacobian_ccs: functions.inequality_jacobian_values.as_ref().map_or_else(
                 || CCS::empty(0, symbolic.variables.nnz()),
                 function_output_ccs,
             ),
@@ -338,8 +369,10 @@ impl CompiledJitNlp {
             },
             objective_value,
             objective_gradient,
-            constraint_values,
-            constraint_jacobian_values,
+            equality_values,
+            equality_jacobian_values,
+            inequality_values,
+            inequality_jacobian_values,
             lagrangian_hessian_values,
         })
     }
@@ -360,12 +393,20 @@ impl CompiledJitNlp {
         self.backend_timing
     }
 
-    pub fn constraint_count(&self) -> Index {
-        self.constraint_jacobian_ccs.nrow
+    pub fn equality_count(&self) -> Index {
+        self.equality_jacobian_ccs.nrow
     }
 
-    pub fn constraint_jacobian_ccs(&self) -> &CCS {
-        &self.constraint_jacobian_ccs
+    pub fn inequality_base_count(&self) -> Index {
+        self.inequality_base_jacobian_ccs.nrow
+    }
+
+    pub fn equality_jacobian_ccs(&self) -> &CCS {
+        &self.equality_jacobian_ccs
+    }
+
+    pub fn inequality_base_jacobian_ccs(&self) -> &CCS {
+        &self.inequality_base_jacobian_ccs
     }
 
     pub fn lagrangian_hessian_ccs(&self) -> &CCS {
@@ -385,24 +426,46 @@ impl CompiledJitNlp {
         self.objective_gradient.eval_vector(x, parameters, out);
     }
 
-    pub fn constraint_values(
+    pub fn equality_values(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
     ) {
-        if let Some(kernel) = &self.constraint_values {
+        if let Some(kernel) = &self.equality_values {
             kernel.eval_vector(x, parameters, out);
         }
     }
 
-    pub fn constraint_jacobian_values(
+    pub fn equality_jacobian_values(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
     ) {
-        if let Some(kernel) = &self.constraint_jacobian_values {
+        if let Some(kernel) = &self.equality_jacobian_values {
+            kernel.eval_vector(x, parameters, out);
+        }
+    }
+
+    pub fn inequality_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        if let Some(kernel) = &self.inequality_values {
+            kernel.eval_vector(x, parameters, out);
+        }
+    }
+
+    pub fn inequality_jacobian_values(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) {
+        if let Some(kernel) = &self.inequality_jacobian_values {
             kernel.eval_vector(x, parameters, out);
         }
     }
@@ -411,11 +474,12 @@ impl CompiledJitNlp {
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
-        constraint_multipliers: &[f64],
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
         out: &mut [f64],
     ) {
         self.lagrangian_hessian_values
-            .eval_hessian(x, parameters, constraint_multipliers, out);
+            .eval_hessian(x, parameters, equality_multipliers, inequality_multipliers, out);
     }
 
     pub fn bind_runtime_bounds(
@@ -423,28 +487,29 @@ impl CompiledJitNlp {
         bounds: RuntimeNlpBounds,
     ) -> Result<RuntimeBoundedJitNlp<'_>, RuntimeNlpBoundsError> {
         let variable_bounds = validate_bound_vectors(self.dimension, bounds.variables, true)?;
-        let constraint_bounds =
-            validate_bound_vectors(self.constraint_count(), bounds.constraints, false)?;
-        let mapping = ConstraintMapping::from_runtime_bounds(
-            self.constraint_jacobian_ccs(),
-            &constraint_bounds,
+        let inequality_bounds =
+            validate_bound_vectors(self.inequality_base_count(), bounds.inequalities, false)?;
+        let mapping = InequalityMapping::from_runtime_bounds(
+            self.inequality_base_jacobian_ccs(),
+            &inequality_bounds,
         );
         Ok(RuntimeBoundedJitNlp {
             base: self,
             variable_bounds,
-            mapping,
+            inequality_mapping: mapping,
         })
     }
 }
 
-impl<X, P, C> TypedCompiledJitNlp<X, P, C>
+impl<X, P, E, I> TypedCompiledJitNlp<X, P, E, I>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <C as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
 {
     pub fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.inner.backend_timing_metadata()
@@ -452,16 +517,16 @@ where
 
     pub fn bind_runtime_bounds(
         &self,
-        bounds: &TypedRuntimeNlpBounds<X, C>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
     ) -> Result<RuntimeBoundedJitNlp<'_>, RuntimeNlpBoundsError> {
         self.inner.bind_runtime_bounds(RuntimeNlpBounds {
             variables: ConstraintBounds {
                 lower: bounds.variable_lower.as_ref().map(flatten_value),
                 upper: bounds.variable_upper.as_ref().map(flatten_value),
             },
-            constraints: ConstraintBounds {
-                lower: bounds.constraint_lower.as_ref().map(flatten_value),
-                upper: bounds.constraint_upper.as_ref().map(flatten_value),
+            inequalities: ConstraintBounds {
+                lower: bounds.inequality_lower.as_ref().map(flatten_value),
+                upper: bounds.inequality_upper.as_ref().map(flatten_value),
             },
         })
     }
@@ -470,7 +535,7 @@ where
         &self,
         x0: &<X as Vectorize<SX>>::Rebind<f64>,
         parameters: &<P as Vectorize<SX>>::Rebind<f64>,
-        bounds: &TypedRuntimeNlpBounds<X, C>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &ClarabelSqpOptions,
     ) -> Result<ClarabelSqpSummary, ClarabelSqpError> {
         let bound_problem = self
@@ -493,7 +558,7 @@ where
         &self,
         x0: &<X as Vectorize<SX>>::Rebind<f64>,
         parameters: &<P as Vectorize<SX>>::Rebind<f64>,
-        bounds: &TypedRuntimeNlpBounds<X, C>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &ClarabelSqpOptions,
         callback: CB,
     ) -> Result<ClarabelSqpSummary, ClarabelSqpError>
@@ -526,7 +591,7 @@ where
         &self,
         x0: &<X as Vectorize<SX>>::Rebind<f64>,
         parameters: &<P as Vectorize<SX>>::Rebind<f64>,
-        bounds: &TypedRuntimeNlpBounds<X, C>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &InteriorPointOptions,
     ) -> Result<InteriorPointSummary, InteriorPointSolveError> {
         let bound_problem = self
@@ -549,7 +614,7 @@ where
         &self,
         x0: &<X as Vectorize<SX>>::Rebind<f64>,
         parameters: &<P as Vectorize<SX>>::Rebind<f64>,
-        bounds: &TypedRuntimeNlpBounds<X, C>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &InteriorPointOptions,
         callback: CB,
     ) -> Result<InteriorPointSummary, InteriorPointSolveError>
@@ -583,7 +648,7 @@ where
         &self,
         x0: &<X as Vectorize<SX>>::Rebind<f64>,
         parameters: &<P as Vectorize<SX>>::Rebind<f64>,
-        bounds: &TypedRuntimeNlpBounds<X, C>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &IpoptOptions,
     ) -> Result<IpoptSummary, IpoptSolveError> {
         let bound_problem = self
@@ -640,11 +705,11 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     }
 
     fn equality_count(&self) -> Index {
-        self.mapping.equality_rows.len()
+        self.base.equality_count()
     }
 
     fn inequality_count(&self) -> Index {
-        self.mapping.inequality_rows.len()
+        self.inequality_mapping.rows.len()
     }
 
     fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
@@ -656,16 +721,11 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     }
 
     fn equality_jacobian_ccs(&self) -> &CCS {
-        &self.mapping.equality_jacobian_ccs
+        self.base.equality_jacobian_ccs()
     }
 
     fn equality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
-        let mut constraint_values = vec![0.0; self.base.constraint_count()];
-        self.base
-            .constraint_values(x, parameters, &mut constraint_values);
-        for (slot, transform) in out.iter_mut().zip(self.mapping.equality_rows.iter()) {
-            *slot = transform.sign * constraint_values[transform.source_index] + transform.offset;
-        }
+        self.base.equality_values(x, parameters, out);
     }
 
     fn equality_jacobian_values(
@@ -674,24 +734,19 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
     ) {
-        let mut source_values = vec![0.0; self.base.constraint_jacobian_ccs().nnz()];
-        self.base
-            .constraint_jacobian_values(x, parameters, &mut source_values);
-        for (slot, mapping) in out.iter_mut().zip(self.mapping.equality_value_map.iter()) {
-            *slot = mapping.sign * source_values[mapping.source_value_index];
-        }
+        self.base.equality_jacobian_values(x, parameters, out);
     }
 
     fn inequality_jacobian_ccs(&self) -> &CCS {
-        &self.mapping.inequality_jacobian_ccs
+        &self.inequality_mapping.inequality_jacobian_ccs
     }
 
     fn inequality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
-        let mut constraint_values = vec![0.0; self.base.constraint_count()];
+        let mut inequality_values = vec![0.0; self.base.inequality_base_count()];
         self.base
-            .constraint_values(x, parameters, &mut constraint_values);
-        for (slot, transform) in out.iter_mut().zip(self.mapping.inequality_rows.iter()) {
-            *slot = transform.sign * constraint_values[transform.source_index] + transform.offset;
+            .inequality_values(x, parameters, &mut inequality_values);
+        for (slot, transform) in out.iter_mut().zip(self.inequality_mapping.rows.iter()) {
+            *slot = transform.sign * inequality_values[transform.source_index] + transform.offset;
         }
     }
 
@@ -701,10 +756,10 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
     ) {
-        let mut source_values = vec![0.0; self.base.constraint_jacobian_ccs().nnz()];
+        let mut source_values = vec![0.0; self.base.inequality_base_jacobian_ccs().nnz()];
         self.base
-            .constraint_jacobian_values(x, parameters, &mut source_values);
-        for (slot, mapping) in out.iter_mut().zip(self.mapping.inequality_value_map.iter()) {
+            .inequality_jacobian_values(x, parameters, &mut source_values);
+        for (slot, mapping) in out.iter_mut().zip(self.inequality_mapping.inequality_value_map.iter()) {
             *slot = mapping.sign * source_values[mapping.source_value_index];
         }
     }
@@ -721,48 +776,34 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         inequality_multipliers: &[f64],
         out: &mut [f64],
     ) {
-        let mut constraint_multipliers = vec![0.0; self.base.constraint_count()];
-        for (multiplier, transform) in equality_multipliers
-            .iter()
-            .zip(self.mapping.equality_rows.iter())
-        {
-            constraint_multipliers[transform.source_index] += transform.sign * multiplier;
-        }
+        let mut base_inequality_multipliers = vec![0.0; self.base.inequality_base_count()];
         for (multiplier, transform) in inequality_multipliers
             .iter()
-            .zip(self.mapping.inequality_rows.iter())
+            .zip(self.inequality_mapping.rows.iter())
         {
-            constraint_multipliers[transform.source_index] += transform.sign * multiplier;
+            base_inequality_multipliers[transform.source_index] += transform.sign * multiplier;
         }
         self.base
-            .lagrangian_hessian_values(x, parameters, &constraint_multipliers, out);
+            .lagrangian_hessian_values(x, parameters, equality_multipliers, &base_inequality_multipliers, out);
     }
 }
 
-impl ConstraintMapping {
+impl InequalityMapping {
     fn from_runtime_bounds(base_ccs: &CCS, bounds: &ConstraintBounds) -> Self {
         let lower = bounds.lower.as_deref().unwrap_or(&[]).to_vec();
         let upper = bounds.upper.as_deref().unwrap_or(&[]).to_vec();
         let count = base_ccs.nrow;
-        let mut equality_rows = Vec::new();
         let mut inequality_rows = Vec::new();
-        let mut equality_by_source = vec![Vec::<(Index, f64)>::new(); count];
         let mut inequality_by_source = vec![Vec::<(Index, f64)>::new(); count];
 
-        for source_index in 0..count {
+        for (source_index, rows_for_source) in inequality_by_source
+            .iter_mut()
+            .enumerate()
+            .take(count)
+        {
             let lower_bound = lower.get(source_index).copied().unwrap_or(-crate::NLP_INF);
             let upper_bound = upper.get(source_index).copied().unwrap_or(crate::NLP_INF);
             if lower_bound == -crate::NLP_INF && upper_bound == crate::NLP_INF {
-                continue;
-            }
-            if lower_bound == upper_bound {
-                let row = equality_rows.len();
-                equality_rows.push(ConstraintTransform {
-                    source_index,
-                    sign: 1.0,
-                    offset: -lower_bound,
-                });
-                equality_by_source[source_index].push((row, 1.0));
                 continue;
             }
             if lower_bound > -crate::NLP_INF {
@@ -772,7 +813,7 @@ impl ConstraintMapping {
                     sign: -1.0,
                     offset: lower_bound,
                 });
-                inequality_by_source[source_index].push((row, -1.0));
+                rows_for_source.push((row, -1.0));
             }
             if upper_bound < crate::NLP_INF {
                 let row = inequality_rows.len();
@@ -781,20 +822,15 @@ impl ConstraintMapping {
                     sign: 1.0,
                     offset: -upper_bound,
                 });
-                inequality_by_source[source_index].push((row, 1.0));
+                rows_for_source.push((row, 1.0));
             }
         }
 
-        let (equality_jacobian_ccs, equality_value_map) =
-            remap_constraint_jacobian(base_ccs, &equality_by_source);
         let (inequality_jacobian_ccs, inequality_value_map) =
             remap_constraint_jacobian(base_ccs, &inequality_by_source);
         Self {
-            equality_rows,
-            inequality_rows,
-            equality_jacobian_ccs,
+            rows: inequality_rows,
             inequality_jacobian_ccs,
-            equality_value_map,
             inequality_value_map,
         }
     }
@@ -812,14 +848,14 @@ impl JitKernel {
 
     fn eval_scalar(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
         let mut context = lock_context(&self.context);
-        load_jit_inputs(&self.function, &mut context, x, parameters, &[]);
+        load_jit_inputs(&self.function, &mut context, x, parameters, &[], &[]);
         self.function.eval(&mut context);
         context.output(0)[0]
     }
 
     fn eval_vector(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
         let mut context = lock_context(&self.context);
-        load_jit_inputs(&self.function, &mut context, x, parameters, &[]);
+        load_jit_inputs(&self.function, &mut context, x, parameters, &[], &[]);
         self.function.eval(&mut context);
         out.copy_from_slice(context.output(0));
     }
@@ -828,7 +864,8 @@ impl JitKernel {
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
-        constraint_multipliers: &[f64],
+        equality_multipliers: &[f64],
+        inequality_multipliers: &[f64],
         out: &mut [f64],
     ) {
         let mut context = lock_context(&self.context);
@@ -837,7 +874,8 @@ impl JitKernel {
             &mut context,
             x,
             parameters,
-            constraint_multipliers,
+            equality_multipliers,
+            inequality_multipliers,
         );
         self.function.eval(&mut context);
         out.copy_from_slice(context.output(0));
@@ -868,8 +906,10 @@ fn function_output_ccs(function: &SXFunction) -> CCS {
 struct DerivedSymbolicFunctions {
     objective_value: SXFunction,
     objective_gradient: SXFunction,
-    constraint_values: Option<SXFunction>,
-    constraint_jacobian_values: Option<SXFunction>,
+    equality_values: Option<SXFunction>,
+    equality_jacobian_values: Option<SXFunction>,
+    inequality_values: Option<SXFunction>,
+    inequality_jacobian_values: Option<SXFunction>,
     lagrangian_hessian_values: SXFunction,
 }
 
@@ -889,27 +929,52 @@ fn derive_symbolic_functions(
         vec![NamedMatrix::new("gradient", gradient)?],
     )?;
 
-    let constraint_values = symbolic
-        .constraints
+    let equality_values = symbolic
+        .equalities
         .as_ref()
-        .map(|constraints| {
+        .map(|equalities| {
             SXFunction::new(
-                format!("{}_constraints", symbolic.name),
+                format!("{}_equalities", symbolic.name),
                 base_inputs.clone(),
-                vec![NamedMatrix::new("constraints", constraints.clone())?],
+                vec![NamedMatrix::new("equalities", equalities.clone())?],
             )
         })
         .transpose()?;
-    let constraint_jacobian_values = symbolic
-        .constraints
+    let equality_jacobian_values = symbolic
+        .equalities
         .as_ref()
-        .map(|constraints| {
+        .map(|equalities| {
             SXFunction::new(
-                format!("{}_constraint_jacobian", symbolic.name),
+                format!("{}_equality_jacobian", symbolic.name),
                 base_inputs.clone(),
                 vec![NamedMatrix::new(
-                    "constraint_jacobian",
-                    constraints.jacobian(&symbolic.variables)?,
+                    "equality_jacobian",
+                    equalities.jacobian(&symbolic.variables)?,
+                )?],
+            )
+        })
+        .transpose()?;
+    let inequality_values = symbolic
+        .inequalities
+        .as_ref()
+        .map(|inequalities| {
+            SXFunction::new(
+                format!("{}_inequalities", symbolic.name),
+                base_inputs.clone(),
+                vec![NamedMatrix::new("inequalities", inequalities.clone())?],
+            )
+        })
+        .transpose()?;
+    let inequality_jacobian_values = symbolic
+        .inequalities
+        .as_ref()
+        .map(|inequalities| {
+            SXFunction::new(
+                format!("{}_inequality_jacobian", symbolic.name),
+                base_inputs.clone(),
+                vec![NamedMatrix::new(
+                    "inequality_jacobian",
+                    inequalities.jacobian(&symbolic.variables)?,
                 )?],
             )
         })
@@ -917,16 +982,22 @@ fn derive_symbolic_functions(
 
     let mut hessian_inputs = base_inputs.clone();
     let mut lagrangian = symbolic.objective.scalar_expr()?;
-    let constraint_count = symbolic.constraints.as_ref().map_or(0, SXMatrix::nnz);
-    if let Some(constraints) = &symbolic.constraints {
-        let lambda = SXMatrix::sym(
-            "lambda_constraints",
-            CoreCcs::column_vector(constraint_count)?,
-        )?;
-        for idx in 0..constraints.nnz() {
-            lagrangian += lambda.nz(idx) * constraints.nz(idx);
+    let equality_count = symbolic.equalities.as_ref().map_or(0, SXMatrix::nnz);
+    if let Some(equalities) = &symbolic.equalities {
+        let lambda = SXMatrix::sym("lambda_equalities", CoreCcs::column_vector(equality_count)?)?;
+        for idx in 0..equalities.nnz() {
+            lagrangian += lambda.nz(idx) * equalities.nz(idx);
         }
-        hessian_inputs.push(NamedMatrix::new("lambda_constraints", lambda)?);
+        hessian_inputs.push(NamedMatrix::new("lambda_equalities", lambda)?);
+    }
+    let inequality_count = symbolic.inequalities.as_ref().map_or(0, SXMatrix::nnz);
+    if let Some(inequalities) = &symbolic.inequalities {
+        let lambda =
+            SXMatrix::sym("lambda_inequalities", CoreCcs::column_vector(inequality_count)?)?;
+        for idx in 0..inequalities.nnz() {
+            lagrangian += lambda.nz(idx) * inequalities.nz(idx);
+        }
+        hessian_inputs.push(NamedMatrix::new("lambda_inequalities", lambda)?);
     }
     let lagrangian_hessian = SXMatrix::scalar(lagrangian).hessian(&symbolic.variables)?;
     let lagrangian_hessian_values = SXFunction::new(
@@ -938,8 +1009,10 @@ fn derive_symbolic_functions(
     Ok(DerivedSymbolicFunctions {
         objective_value,
         objective_gradient,
-        constraint_values,
-        constraint_jacobian_values,
+        equality_values,
+        equality_jacobian_values,
+        inequality_values,
+        inequality_jacobian_values,
         lagrangian_hessian_values,
     })
 }
@@ -956,14 +1029,16 @@ fn load_jit_inputs(
     context: &mut JitExecutionContext,
     x: &[f64],
     parameters: &[ParameterMatrix<'_>],
-    constraint_multipliers: &[f64],
+    equality_multipliers: &[f64],
+    inequality_multipliers: &[f64],
 ) {
     let mut parameter_index = 0;
     for (slot_index, slot) in function.lowered().inputs.iter().enumerate() {
         let input = context.input_mut(slot_index);
         match slot.name.as_str() {
             "x" => input.copy_from_slice(x),
-            "lambda_constraints" => input.copy_from_slice(constraint_multipliers),
+            "lambda_equalities" => input.copy_from_slice(equality_multipliers),
+            "lambda_inequalities" => input.copy_from_slice(inequality_multipliers),
             _ => {
                 input.copy_from_slice(parameters[parameter_index].values);
                 parameter_index += 1;

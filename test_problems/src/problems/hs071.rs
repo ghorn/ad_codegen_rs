@@ -3,10 +3,10 @@ use sx_core::SX;
 
 use crate::model::{ProblemRunRecord, ValidationOutcome, ValidationTier};
 
-use super::{CaseMetadata, Pair, ProblemCase, VecN, make_typed_case, symbolic_compile};
+use super::{CaseMetadata, ProblemCase, VecN, make_typed_case, symbolic_compile};
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<VecN<SX, 4>, (), Pair<SX>, _, _>(
+    make_typed_case::<VecN<SX, 4>, (), SX, SX, _, _>(
         CaseMetadata::new(
             "hs071",
             "hock_schittkowski",
@@ -16,7 +16,7 @@ pub(crate) fn case() -> ProblemCase {
             false,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<VecN<SX, 4>, (), Pair<SX>, _>(
+            let compiled = symbolic_compile::<VecN<SX, 4>, (), SX, SX, _>(
                 "hs071",
                 |x, ()| {
                     let x0 = x.values[0];
@@ -25,10 +25,8 @@ pub(crate) fn case() -> ProblemCase {
                     let x3 = x.values[3];
                     SymbolicNlpOutputs {
                         objective: x0 * x3 * (x0 + x1 + x2) + x2,
-                        constraints: Pair {
-                            x: x0.sqr() + x1.sqr() + x2.sqr() + x3.sqr() - 40.0,
-                            y: 25.0 - x0 * x1 * x2 * x3,
-                        },
+                        equalities: x0.sqr() + x1.sqr() + x2.sqr() + x3.sqr() - 40.0,
+                        inequalities: 25.0 - x0 * x1 * x2 * x3,
                     }
                 },
                 jit_opt_level,
@@ -46,11 +44,8 @@ pub(crate) fn case() -> ProblemCase {
                     variable_upper: Some(VecN {
                         values: [5.0, 5.0, 5.0, 5.0],
                     }),
-                    constraint_lower: Some(Pair {
-                        x: 0.0,
-                        y: -f64::INFINITY,
-                    }),
-                    constraint_upper: Some(Pair { x: 0.0, y: 0.0 }),
+                    inequality_lower: Some(-f64::INFINITY),
+                    inequality_upper: Some(0.0),
                 },
             })
         },

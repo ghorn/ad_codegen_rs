@@ -14,7 +14,7 @@ pub(crate) fn cases() -> Vec<ProblemCase> {
 }
 
 fn case_for<const N: usize>(id: &'static str, variant: &'static str) -> ProblemCase {
-    make_typed_case::<VecN<SX, N>, (), (), _, _>(
+    make_typed_case::<VecN<SX, N>, (), (), (), _, _>(
         CaseMetadata::new(
             id,
             "trigonometric",
@@ -24,7 +24,7 @@ fn case_for<const N: usize>(id: &'static str, variant: &'static str) -> ProblemC
             true,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<VecN<SX, N>, (), (), _>(
+            let compiled = symbolic_compile::<VecN<SX, N>, (), (), (), _>(
                 id,
                 |x, ()| {
                     let cos_sum = x
@@ -41,7 +41,8 @@ fn case_for<const N: usize>(id: &'static str, variant: &'static str) -> ProblemC
                         .fold(SX::zero(), |acc, residual| acc + residual.sqr());
                     SymbolicNlpOutputs {
                         objective,
-                        constraints: (),
+                        equalities: (),
+                        inequalities: (),
                     }
                 },
                 jit_opt_level,

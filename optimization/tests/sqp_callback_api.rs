@@ -31,11 +31,12 @@ fn empty_ccs_1d() -> &'static CCS {
     EMPTY.get_or_init(|| CCS::empty(0, 1))
 }
 
-fn unconstrained_rosenbrock_problem() -> optimization::TypedCompiledJitNlp<Pair<SX>, (), ()> {
+fn unconstrained_rosenbrock_problem() -> optimization::TypedCompiledJitNlp<Pair<SX>, (), (), ()> {
     let symbolic =
-        symbolic_nlp::<Pair<SX>, (), (), _>("telemetry_rosenbrock", |x, _| SymbolicNlpOutputs {
+        symbolic_nlp::<Pair<SX>, (), (), (), _>("telemetry_rosenbrock", |x, _| SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-            constraints: (),
+            equalities: (),
+            inequalities: (),
         })
         .expect("symbolic NLP should build");
     symbolic.compile_jit().expect("JIT compile should succeed")
@@ -643,6 +644,10 @@ fn sqp_callback_rosenbrock_reports_line_search_telemetry() {
     .expect("solve should succeed");
 
     assert!(summary.objective <= 1e-10);
+    assert!(summary.profiling.line_search_evaluation_time > std::time::Duration::ZERO);
+    assert!(summary.profiling.line_search_condition_check_time > std::time::Duration::ZERO);
+    assert!(summary.profiling.multiplier_estimation_time > std::time::Duration::ZERO);
+    assert!(summary.profiling.convergence_check_time > std::time::Duration::ZERO);
     assert!(snapshots.iter().any(|snapshot| {
         snapshot
             .line_search
@@ -657,7 +662,64 @@ fn sqp_callback_rosenbrock_reports_line_search_telemetry() {
         {
             assert!(snapshot.events.contains(&SqpIterationEvent::LongLineSearch));
         }
+        if let Some(line_search) = &snapshot.line_search {
+            assert!(line_search.armijo_satisfied);
+            assert_eq!(line_search.rejected_trials.len(), line_search.backtrack_count);
+            for trial in &line_search.rejected_trials {
+                assert!(!trial.armijo_satisfied || trial.wolfe_satisfied == Some(false));
+            }
+        }
     }
+}
+
+#[test]
+fn sqp_callback_exposes_wolfe_status_when_enabled() {
+    let problem = OneDimQuadraticProblem;
+    let mut snapshots = Vec::new();
+    let options = ClarabelSqpOptions {
+        verbose: false,
+        wolfe_c2: Some(0.9),
+        ..ClarabelSqpOptions::default()
+    };
+    let summary = solve_nlp_sqp_with_callback(&problem, &[0.0], &[], &options, |snapshot| {
+        snapshots.push(snapshot.clone());
+    })
+    .expect("solve should succeed with Wolfe telemetry enabled");
+
+    let line_search = summary
+        .final_state
+        .line_search
+        .as_ref()
+        .expect("final state should include the accepted line search");
+    assert_eq!(line_search.wolfe_satisfied, Some(true));
+    assert!(line_search.armijo_satisfied);
+    assert!(line_search.violation_satisfied);
+    assert!(line_search.rejected_trials.is_empty());
+    assert!(snapshots.iter().all(|snapshot| {
+        snapshot.line_search.as_ref().is_none_or(|line_search| {
+            line_search.wolfe_satisfied.is_some()
+        })
+    }));
+}
+
+#[test]
+fn sqp_callback_honors_max_line_search_steps() {
+    let compiled = unconstrained_rosenbrock_problem();
+    let problem = compiled
+        .bind_runtime_bounds(&optimization::TypedRuntimeNlpBounds::default())
+        .expect("runtime bounds should validate");
+    let error = solve_nlp_sqp(
+        &problem,
+        &[-1.2, 1.0],
+        &[],
+        &ClarabelSqpOptions {
+            verbose: false,
+            max_line_search_steps: 0,
+            ..ClarabelSqpOptions::default()
+        },
+    )
+    .expect_err("line search should fail when no backtracking is allowed");
+    assert!(matches!(error, ClarabelSqpError::LineSearchFailed { .. }));
 }
 
 #[test]
@@ -714,6 +776,22 @@ fn sqp_qp_failure_diagnostics_surface_on_infeasible_case() {
             assert_eq!(final_state.eq_inf, Some(1.0));
             assert_eq!(final_state.ineq_inf, None);
             assert_eq!(final_state.comp_inf, None);
+            let qp_failure = context
+                .qp_failure
+                .as_ref()
+                .expect("failed QP should expose diagnostics");
+            assert_eq!(qp_failure.variable_count, 1);
+            assert_eq!(qp_failure.constraint_count, 1);
+            assert!(!qp_failure.cones.is_empty());
+            assert!(!qp_failure.elastic_recovery);
+            assert_eq!(qp_failure.qp_info.raw_status, clarabel::solver::SolverStatus::PrimalInfeasible);
+            #[cfg(unix)]
+            assert!(
+                qp_failure
+                    .transcript
+                    .as_ref()
+                    .is_some_and(|transcript| !transcript.trim().is_empty())
+            );
         }
         other => panic!("expected QpSolve error, got {other:?}"),
     }

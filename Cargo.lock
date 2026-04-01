@@ -1101,6 +1101,7 @@ dependencies = [
  "examples_run",
  "examples_source",
  "ipopt",
+ "libc",
  "nalgebra",
  "optimization_derive",
  "rstest",

@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Type, parse_macro_input,
-    parse_quote,
+    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Type,
+    parse_macro_input, parse_quote,
 };
 
 #[proc_macro_derive(Vectorize)]
@@ -21,6 +21,10 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
     let replacement: Type = parse_quote!(U);
     let output_ty = rebind_generics(&ident, &generics, &replacement);
     let output_expr = rebind_expr_path(&ident, &generics);
+    let view_ident = format_ident!("{ident}View");
+    let view_decl_generics = prepend_lifetime_to_generics(&generics, "'a");
+    let view_use_generics = prepend_lifetime_to_generic_args(&generics, quote!('a));
+    let view_self_generics = prepend_lifetime_to_generic_args(&generics, quote!('_));
 
     let Data::Struct(data) = input.data else {
         return Err(syn::Error::new_spanned(
@@ -30,6 +34,21 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
     };
 
     let field_types = field_types(&data.fields);
+    let mut where_predicates = where_clause.cloned().unwrap_or_else(|| parse_quote!(where));
+    where_predicates
+        .predicates
+        .push(parse_quote!(#leaf_ident: ::optimization::ScalarLeaf));
+    for field_ty in &field_types {
+        if !is_leaf_type(field_ty, &leaf_ident) {
+            where_predicates
+                .predicates
+                .push(parse_quote!(#field_ty: ::optimization::Vectorize<#leaf_ident>));
+        }
+    }
+    let mut view_where_predicates = where_predicates.clone();
+    view_where_predicates
+        .predicates
+        .push(parse_quote!(#leaf_ident: 'a));
     let flatten_statements = data.fields.iter().enumerate().map(|(index, field)| {
         let access = field_access(index, field.ident.as_ref());
         if is_leaf_type(&field.ty, &leaf_ident) {
@@ -51,6 +70,49 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
         let value_expr = construct_value_expr(&field.ty, &leaf_ident);
         quote! { #access: #value_expr }
     });
+    let view_field_defs = data.fields.iter().enumerate().map(|(index, field)| {
+        let access = field.ident.clone().map_or_else(
+            || {
+                let tuple_index = Index::from(index);
+                quote!(#tuple_index)
+            },
+            |name| quote!(#name),
+        );
+        let view_ty = if is_leaf_type(&field.ty, &leaf_ident) {
+            quote!(&'a #leaf_ident)
+        } else {
+            let field_ty = &field.ty;
+            quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::View<'a>)
+        };
+        quote! { pub #access: #view_ty }
+    });
+    let view_construct_fields = data.fields.iter().enumerate().map(|(index, field)| {
+        let access = field.ident.clone().map_or_else(
+            || {
+                let tuple_index = Index::from(index);
+                quote!(#tuple_index)
+            },
+            |name| quote!(#name),
+        );
+        let value_expr = construct_view_expr(&field.ty, &leaf_ident);
+        quote! { #access: #value_expr }
+    });
+    let view_self_fields = data.fields.iter().enumerate().map(|(index, field)| {
+        let access = field.ident.clone().map_or_else(
+            || {
+                let tuple_index = Index::from(index);
+                quote!(#tuple_index)
+            },
+            |name| quote!(#name),
+        );
+        let value_expr = if is_leaf_type(&field.ty, &leaf_ident) {
+            quote!(&self.#access)
+        } else {
+            let field_ty = &field.ty;
+            quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::view(&self.#access))
+        };
+        quote! { #access: #value_expr }
+    });
     let len_terms = field_types.iter().map(|field_ty| {
         if is_leaf_type(field_ty, &leaf_ident) {
             quote!(1usize)
@@ -63,23 +125,72 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
         Fields::Unnamed(_) => quote!(#output_expr ( #(#construct_fields,)* )),
         Fields::Unit => quote!(#output_expr),
     };
-    let mut where_predicates = where_clause.cloned().unwrap_or_else(|| parse_quote!(where));
-    where_predicates
-        .predicates
-        .push(parse_quote!(#leaf_ident: ::optimization::ScalarLeaf));
-    for field_ty in &field_types {
-        if !is_leaf_type(field_ty, &leaf_ident) {
-            where_predicates
-                .predicates
-                .push(parse_quote!(#field_ty: ::optimization::Vectorize<#leaf_ident>));
+    let view_struct = match &data.fields {
+        Fields::Named(_) => quote! {
+            pub struct #view_ident #view_decl_generics
+            #view_where_predicates
+            {
+                #(#view_field_defs,)*
+            }
+        },
+        Fields::Unnamed(fields) => {
+            let types = fields.unnamed.iter().map(|field| {
+                if is_leaf_type(&field.ty, &leaf_ident) {
+                    quote!(&'a #leaf_ident)
+                } else {
+                    let field_ty = &field.ty;
+                    quote!(<#field_ty as ::optimization::Vectorize<#leaf_ident>>::View<'a>)
+                }
+            });
+            quote! {
+                pub struct #view_ident #view_decl_generics
+                #view_where_predicates
+                ( #(pub #types),* );
+            }
         }
-    }
-
+        Fields::Unit => quote! {
+            pub struct #view_ident #view_decl_generics
+            #view_where_predicates
+            ;
+        },
+    };
+    let view_construct_expr = match &data.fields {
+        Fields::Named(_) => {
+            quote!(#view_ident :: #view_use_generics { #(#view_construct_fields,)* })
+        }
+        Fields::Unnamed(_) => {
+            quote!(#view_ident :: #view_use_generics ( #(#view_construct_fields,)* ))
+        }
+        Fields::Unit => quote!(#view_ident :: #view_use_generics),
+    };
+    let view_from_self_expr = match &data.fields {
+        Fields::Named(_) => {
+            quote!(#view_ident :: #view_self_generics { #(#view_self_fields,)* })
+        }
+        Fields::Unnamed(_) => {
+            quote!(#view_ident :: #view_self_generics ( #(#view_self_fields,)* ))
+        }
+        Fields::Unit => quote!(#view_ident :: #view_self_generics),
+    };
     Ok(quote! {
+        #view_struct
+
+        impl #impl_generics #ident #ty_generics
+        #where_predicates
+        {
+            #[doc(hidden)]
+            pub fn __optimization_from_flat<U: ::optimization::ScalarLeaf>(
+                f: &mut impl ::core::ops::FnMut() -> U
+            ) -> #output_ty {
+                #construct_expr
+            }
+        }
+
         impl #impl_generics ::optimization::Vectorize<#leaf_ident> for #ident #ty_generics
         #where_predicates
         {
             type Rebind<U: ::optimization::ScalarLeaf> = #output_ty;
+            type View<'a> = #view_ident #view_use_generics where #leaf_ident: 'a, Self: 'a;
 
             const LEN: usize = 0 #(+ #len_terms)*;
 
@@ -90,7 +201,25 @@ fn derive_vectorize_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenSt
             fn from_flat_fn<U: ::optimization::ScalarLeaf>(
                 f: &mut impl ::core::ops::FnMut() -> U
             ) -> Self::Rebind<U> {
-                #construct_expr
+                Self::__optimization_from_flat::<U>(f)
+            }
+
+            fn view<'a>(&'a self) -> Self::View<'a>
+            where
+                Self: 'a,
+                #leaf_ident: 'a,
+            {
+                #view_from_self_expr
+            }
+
+            fn view_from_flat_slice<'a>(
+                slice: &'a [#leaf_ident],
+                index: &mut usize
+            ) -> Self::View<'a>
+            where
+                #leaf_ident: 'a,
+            {
+                #view_construct_expr
             }
         }
     })
@@ -169,6 +298,47 @@ fn rebind_expr_path(ident: &Ident, generics: &Generics) -> proc_macro2::TokenStr
     quote!(#ident :: < #(#args),* >)
 }
 
+fn prepend_lifetime_to_generics(generics: &Generics, lifetime: &str) -> proc_macro2::TokenStream {
+    let lifetime: syn::Lifetime = syn::parse_str(lifetime).expect("valid lifetime");
+    let params = generics.params.iter().map(|param| match param {
+        GenericParam::Type(type_param) => {
+            let ident = &type_param.ident;
+            quote!(#ident)
+        }
+        GenericParam::Const(const_param) => {
+            let ident = &const_param.ident;
+            let ty = &const_param.ty;
+            quote!(const #ident: #ty)
+        }
+        GenericParam::Lifetime(existing) => {
+            let lt = &existing.lifetime;
+            quote!(#lt)
+        }
+    });
+    quote!(< #lifetime, #(#params),* >)
+}
+
+fn prepend_lifetime_to_generic_args(
+    generics: &Generics,
+    lifetime: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let args = generics.params.iter().map(|param| match param {
+        GenericParam::Type(type_param) => {
+            let ident = &type_param.ident;
+            quote!(#ident)
+        }
+        GenericParam::Const(const_param) => {
+            let ident = &const_param.ident;
+            quote!(#ident)
+        }
+        GenericParam::Lifetime(existing) => {
+            let lt = &existing.lifetime;
+            quote!(#lt)
+        }
+    });
+    quote!(< #lifetime, #(#args),* >)
+}
+
 fn is_leaf_type(ty: &Type, leaf_ident: &Ident) -> bool {
     match ty {
         Type::Path(path) => path.qself.is_none() && path.path.is_ident(leaf_ident),
@@ -184,6 +354,17 @@ fn construct_value_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStre
         let value_expr = construct_value_expr(&array.elem, leaf_ident);
         quote!(::std::array::from_fn(|_| #value_expr))
     } else {
-        quote!(<#ty as ::optimization::Vectorize<#leaf_ident>>::from_flat_fn::<U>(f))
+        quote!(<#ty>::__optimization_from_flat::<U>(f))
     }
+}
+
+fn construct_view_expr(ty: &Type, leaf_ident: &Ident) -> proc_macro2::TokenStream {
+    if is_leaf_type(ty, leaf_ident) {
+        return quote!({
+            let value = &slice[*index];
+            *index += 1;
+            value
+        });
+    }
+    quote!(<#ty as ::optimization::Vectorize<#leaf_ident>>::view_from_flat_slice(slice, index))
 }

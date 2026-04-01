@@ -6,7 +6,7 @@ use super::{
 };
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<VecN<SX, 4>, (), (), _, _>(
+    make_typed_case::<VecN<SX, 4>, (), (), (), _, _>(
         CaseMetadata::new(
             "powell_singular_4",
             "powell_singular",
@@ -16,7 +16,7 @@ pub(crate) fn case() -> ProblemCase {
             false,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<VecN<SX, 4>, (), (), _>(
+            let compiled = symbolic_compile::<VecN<SX, 4>, (), (), (), _>(
                 "powell_singular_4",
                 |x, ()| {
                     let f1 = x.values[0] + 10.0 * x.values[1];
@@ -25,7 +25,8 @@ pub(crate) fn case() -> ProblemCase {
                     let f4 = 10.0_f64.sqrt() * (x.values[0] - x.values[3]).sqr();
                     SymbolicNlpOutputs {
                         objective: f1.sqr() + f2.sqr() + f3.sqr() + f4.sqr(),
-                        constraints: (),
+                        equalities: (),
+                        inequalities: (),
                     }
                 },
                 jit_opt_level,

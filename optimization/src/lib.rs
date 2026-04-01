@@ -4,8 +4,13 @@ use clarabel::solver::SupportedConeT::{NonnegativeConeT, ZeroConeT};
 use clarabel::solver::implementations::default::DefaultSettingsBuilder;
 use clarabel::solver::{DefaultSolver, IPSolver, SolverStatus};
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
-use std::io::{self, IsTerminal};
-use std::sync::OnceLock;
+#[cfg(unix)]
+use std::fs::File;
+use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 pub use sx_codegen_llvm::LlvmOptimizationLevel;
 use thiserror::Error;
@@ -35,7 +40,10 @@ pub use symbolic::{
     SymbolicNlpCompileError, SymbolicNlpOutputs, TypedCompiledJitNlp, TypedRuntimeNlpBounds,
     TypedSymbolicNlp, symbolic_nlp,
 };
-pub use vectorize::{ScalarLeaf, Vectorize, flatten_value, symbolic_column, symbolic_value};
+pub use vectorize::{
+    ScalarLeaf, Vectorize, VectorizeLayoutError, flat_view, flatten_value, symbolic_column,
+    symbolic_value, unflatten_value,
+};
 
 pub type Index = usize;
 pub(crate) const NLP_INF: f64 = 1e20;
@@ -74,6 +82,10 @@ pub struct ClarabelSqpProfiling {
     pub qp_setup_time: Duration,
     pub qp_solves: Index,
     pub qp_solve_time: Duration,
+    pub multiplier_estimation_time: Duration,
+    pub line_search_evaluation_time: Duration,
+    pub line_search_condition_check_time: Duration,
+    pub convergence_check_time: Duration,
     pub elastic_recovery_activations: Index,
     pub elastic_recovery_qp_solves: Index,
     pub preprocessing_time: Duration,
@@ -226,7 +238,9 @@ pub struct ClarabelSqpOptions {
     pub merit_penalty: f64,
     pub regularization: f64,
     pub armijo_c1: f64,
+    pub wolfe_c2: Option<f64>,
     pub line_search_beta: f64,
+    pub max_line_search_steps: Index,
     pub min_step: f64,
     pub penalty_increase_factor: f64,
     pub max_penalty_updates: Index,
@@ -250,7 +264,9 @@ impl Default for ClarabelSqpOptions {
             merit_penalty: 10.0,
             regularization: 1e-6,
             armijo_c1: 1e-4,
+            wolfe_c2: None,
             line_search_beta: 0.5,
+            max_line_search_steps: 32,
             min_step: 1e-8,
             penalty_increase_factor: 10.0,
             max_penalty_updates: 8,
@@ -279,6 +295,7 @@ pub enum SqpIterationEvent {
     LongLineSearch,
     QpReducedAccuracy,
     ElasticRecoveryUsed,
+    WolfeRejectedTrial,
     MaxIterationsReached,
 }
 
@@ -335,8 +352,24 @@ pub struct SqpIterationTiming {
     pub lagrangian_hessian_values: Duration,
     pub qp_setup: Duration,
     pub qp_solve: Duration,
+    pub multiplier_estimation: Duration,
+    pub line_search_evaluation: Duration,
+    pub line_search_condition_checks: Duration,
+    pub convergence_check: Duration,
     pub preprocess: Duration,
     pub total: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SqpLineSearchTrial {
+    pub alpha: f64,
+    pub objective: f64,
+    pub merit: f64,
+    pub eq_inf: Option<f64>,
+    pub ineq_inf: Option<f64>,
+    pub armijo_satisfied: bool,
+    pub wolfe_satisfied: Option<bool>,
+    pub violation_satisfied: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,6 +377,10 @@ pub struct SqpLineSearchInfo {
     pub accepted_alpha: f64,
     pub last_tried_alpha: f64,
     pub backtrack_count: Index,
+    pub armijo_satisfied: bool,
+    pub wolfe_satisfied: Option<bool>,
+    pub violation_satisfied: bool,
+    pub rejected_trials: Vec<SqpLineSearchTrial>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,6 +390,26 @@ pub struct SqpQpInfo {
     pub setup_time: Duration,
     pub solve_time: Duration,
     pub iteration_count: Index,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqpConeSummary {
+    pub kind: &'static str,
+    pub dim: Index,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SqpQpFailureDiagnostics {
+    pub qp_info: SqpQpInfo,
+    pub variable_count: Index,
+    pub constraint_count: Index,
+    pub linear_objective_inf_norm: f64,
+    pub rhs_inf_norm: f64,
+    pub hessian_diag_min: f64,
+    pub hessian_diag_max: f64,
+    pub elastic_recovery: bool,
+    pub cones: Vec<SqpConeSummary>,
+    pub transcript: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -400,6 +457,7 @@ pub struct SqpFailureContext {
     pub final_state: Option<SqpIterationSnapshot>,
     pub final_state_kind: Option<SqpFinalStateKind>,
     pub last_accepted_state: Option<SqpIterationSnapshot>,
+    pub qp_failure: Option<SqpQpFailureDiagnostics>,
     pub profiling: ClarabelSqpProfiling,
 }
 
@@ -802,7 +860,7 @@ fn trial_merit<P>(
     bounds: &BoundConstraints,
     penalty: f64,
     timing: (&mut ClarabelSqpProfiling, &mut Duration),
-) -> std::result::Result<f64, NonFiniteCallbackStage>
+) -> std::result::Result<TrialEvaluation, NonFiniteCallbackStage>
 where
     P: CompiledNlpProblem,
 {
@@ -833,17 +891,103 @@ where
     if !objective_value.is_finite() {
         return Err(NonFiniteCallbackStage::ObjectiveValue);
     }
-    Ok(exact_merit_value(
-        objective_value,
-        equality_values,
-        augmented_inequality_values,
-        penalty,
+    let eq_inf = (!equality_values.is_empty()).then_some(inf_norm(equality_values));
+    let ineq_inf =
+        (!augmented_inequality_values.is_empty()).then_some(positive_part_inf_norm(augmented_inequality_values));
+    Ok(TrialEvaluation {
+        objective: objective_value,
+        merit: exact_merit_value(
+            objective_value,
+            equality_values,
+            augmented_inequality_values,
+            penalty,
+        ),
+        eq_inf,
+        ineq_inf,
+        primal_inf: eq_inf.into_iter().chain(ineq_inf).fold(0.0_f64, f64::max),
+    })
+}
+
+fn trial_merit_directional_derivative<P>(
+    problem: &P,
+    request: TrialDerivativeRequest<'_>,
+    profiling: &mut ClarabelSqpProfiling,
+    iteration_callback_time: &mut Duration,
+    workspace: TrialDerivativeWorkspace<'_>,
+) -> std::result::Result<f64, NonFiniteCallbackStage>
+where
+    P: CompiledNlpProblem,
+{
+    time_callback(
+        &mut profiling.objective_gradient,
+        iteration_callback_time,
+        || problem.objective_gradient(request.x, request.parameters, workspace.trial_gradient),
+    );
+    if workspace.trial_gradient.iter().any(|value| !value.is_finite()) {
+        return Err(NonFiniteCallbackStage::ObjectiveGradient);
+    }
+
+    time_callback(
+        &mut profiling.equality_jacobian_values,
+        iteration_callback_time,
+        || {
+            problem.equality_jacobian_values(
+                request.x,
+                request.parameters,
+                workspace.trial_equality_jacobian_values,
+            )
+        },
+    );
+    if workspace
+        .trial_equality_jacobian_values
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(NonFiniteCallbackStage::EqualityJacobianValues);
+    }
+
+    time_callback(
+        &mut profiling.inequality_jacobian_values,
+        iteration_callback_time,
+        || {
+            problem.inequality_jacobian_values(
+                request.x,
+                request.parameters,
+                workspace.trial_inequality_jacobian_values,
+            )
+        },
+    );
+    if workspace
+        .trial_inequality_jacobian_values
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(NonFiniteCallbackStage::InequalityJacobianValues);
+    }
+
+    let equality_jacobian =
+        ccs_to_dense(problem.equality_jacobian_ccs(), workspace.trial_equality_jacobian_values);
+    let nonlinear_inequality_jacobian = ccs_to_dense(
+        problem.inequality_jacobian_ccs(),
+        workspace.trial_inequality_jacobian_values,
+    );
+    let inequality_jacobian =
+        stack_jacobians(&nonlinear_inequality_jacobian, workspace.bound_jacobian);
+    Ok(exact_merit_directional_derivative(
+        workspace.trial_gradient,
+        request.equality_values,
+        &equality_jacobian,
+        request.augmented_inequality_values,
+        &inequality_jacobian,
+        request.step,
+        request.penalty,
     ))
 }
 
 fn snapshot_events(
     penalty_updated: bool,
     line_search_backtracks: Option<Index>,
+    wolfe_rejected: bool,
     qp_info: Option<&SqpQpInfo>,
     elastic_recovery_used: bool,
     max_iterations_reached: bool,
@@ -854,6 +998,9 @@ fn snapshot_events(
     }
     if matches!(line_search_backtracks, Some(iterations) if iterations >= 4) {
         events.push(SqpIterationEvent::LongLineSearch);
+    }
+    if wolfe_rejected {
+        events.push(SqpIterationEvent::WolfeRejectedTrial);
     }
     if matches!(
         qp_info.map(|info| info.status),
@@ -885,14 +1032,295 @@ fn failure_context(
     last_accepted_state: Option<SqpIterationSnapshot>,
     profiling: &ClarabelSqpProfiling,
 ) -> Box<SqpFailureContext> {
+    failure_context_with_qp_failure(
+        termination,
+        final_state,
+        last_accepted_state,
+        None,
+        profiling,
+    )
+}
+
+fn failure_context_with_qp_failure(
+    termination: SqpTermination,
+    final_state: Option<SqpIterationSnapshot>,
+    last_accepted_state: Option<SqpIterationSnapshot>,
+    qp_failure: Option<SqpQpFailureDiagnostics>,
+    profiling: &ClarabelSqpProfiling,
+) -> Box<SqpFailureContext> {
     let final_state_kind = final_state.as_ref().map(final_state_kind);
     Box::new(SqpFailureContext {
         termination,
         final_state,
         final_state_kind,
         last_accepted_state,
+        qp_failure,
         profiling: profiling.clone(),
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrialEvaluation {
+    objective: f64,
+    merit: f64,
+    eq_inf: Option<f64>,
+    ineq_inf: Option<f64>,
+    primal_inf: f64,
+}
+
+struct TrialDerivativeWorkspace<'a> {
+    trial_gradient: &'a mut [f64],
+    trial_equality_jacobian_values: &'a mut [f64],
+    trial_inequality_jacobian_values: &'a mut [f64],
+    bound_jacobian: &'a DMatrix<f64>,
+}
+
+struct TrialDerivativeRequest<'a> {
+    x: &'a [f64],
+    parameters: &'a [ParameterMatrix<'a>],
+    step: &'a [f64],
+    equality_values: &'a [f64],
+    augmented_inequality_values: &'a [f64],
+    penalty: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IterationTimingBaseline {
+    objective_value: Duration,
+    objective_gradient: Duration,
+    equality_values: Duration,
+    inequality_values: Duration,
+    equality_jacobian_values: Duration,
+    inequality_jacobian_values: Duration,
+    lagrangian_hessian_values: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IterationTimingBuckets {
+    qp_setup: Duration,
+    qp_solve: Duration,
+    multiplier_estimation: Duration,
+    line_search_evaluation: Duration,
+    line_search_condition_checks: Duration,
+    convergence_check: Duration,
+    preprocess: Duration,
+    total: Duration,
+}
+
+impl IterationTimingBaseline {
+    fn capture(profiling: &ClarabelSqpProfiling) -> Self {
+        Self {
+            objective_value: profiling.objective_value.total_time,
+            objective_gradient: profiling.objective_gradient.total_time,
+            equality_values: profiling.equality_values.total_time,
+            inequality_values: profiling.inequality_values.total_time,
+            equality_jacobian_values: profiling.equality_jacobian_values.total_time,
+            inequality_jacobian_values: profiling.inequality_jacobian_values.total_time,
+            lagrangian_hessian_values: profiling.lagrangian_hessian_values.total_time,
+        }
+    }
+}
+
+fn build_iteration_timing(
+    baseline: IterationTimingBaseline,
+    profiling: &ClarabelSqpProfiling,
+    buckets: IterationTimingBuckets,
+) -> SqpIterationTiming {
+    SqpIterationTiming {
+        objective_value: profiling
+            .objective_value
+            .total_time
+            .saturating_sub(baseline.objective_value),
+        objective_gradient: profiling
+            .objective_gradient
+            .total_time
+            .saturating_sub(baseline.objective_gradient),
+        equality_values: profiling
+            .equality_values
+            .total_time
+            .saturating_sub(baseline.equality_values),
+        inequality_values: profiling
+            .inequality_values
+            .total_time
+            .saturating_sub(baseline.inequality_values),
+        equality_jacobian_values: profiling
+            .equality_jacobian_values
+            .total_time
+            .saturating_sub(baseline.equality_jacobian_values),
+        inequality_jacobian_values: profiling
+            .inequality_jacobian_values
+            .total_time
+            .saturating_sub(baseline.inequality_jacobian_values),
+        lagrangian_hessian_values: profiling
+            .lagrangian_hessian_values
+            .total_time
+            .saturating_sub(baseline.lagrangian_hessian_values),
+        qp_setup: buckets.qp_setup,
+        qp_solve: buckets.qp_solve,
+        multiplier_estimation: buckets.multiplier_estimation,
+        line_search_evaluation: buckets.line_search_evaluation,
+        line_search_condition_checks: buckets.line_search_condition_checks,
+        convergence_check: buckets.convergence_check,
+        preprocess: buckets.preprocess,
+        total: buckets.total,
+    }
+}
+
+fn cone_summaries(cones: &[clarabel::solver::SupportedConeT<f64>]) -> Vec<SqpConeSummary> {
+    cones.iter()
+        .map(|cone| match cone {
+            clarabel::solver::SupportedConeT::ZeroConeT(dim) => SqpConeSummary {
+                kind: "zero",
+                dim: *dim,
+            },
+            clarabel::solver::SupportedConeT::NonnegativeConeT(dim) => SqpConeSummary {
+                kind: "nonnegative",
+                dim: *dim,
+            },
+            _ => SqpConeSummary {
+                kind: "other",
+                dim: 0,
+            },
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn capture_stdio_output<R>(f: impl FnOnce() -> R) -> io::Result<(String, R)> {
+    static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = CAPTURE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    io::stdout().flush()?;
+    io::stderr().flush()?;
+
+    let mut pipe_fds = [0; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+    let stdout_dup = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    let stderr_dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+    if stdout_dup < 0 || stderr_dup < 0 {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            if stdout_dup >= 0 {
+                libc::close(stdout_dup);
+            }
+            if stderr_dup >= 0 {
+                libc::close(stderr_dup);
+            }
+        }
+        return Err(io::Error::last_os_error());
+    }
+
+    if unsafe { libc::dup2(write_fd, libc::STDOUT_FILENO) } < 0
+        || unsafe { libc::dup2(write_fd, libc::STDERR_FILENO) } < 0
+    {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            libc::close(stdout_dup);
+            libc::close(stderr_dup);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        libc::close(write_fd);
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(f));
+
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    unsafe {
+        libc::dup2(stdout_dup, libc::STDOUT_FILENO);
+        libc::dup2(stderr_dup, libc::STDERR_FILENO);
+        libc::close(stdout_dup);
+        libc::close(stderr_dup);
+    }
+
+    let mut file = unsafe { File::from_raw_fd(read_fd) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    drop(file);
+    let output = String::from_utf8_lossy(&bytes).into_owned();
+
+    match result {
+        Ok(value) => Ok((output, value)),
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_stdio_output<R>(f: impl FnOnce() -> R) -> io::Result<(String, R)> {
+    Ok((String::new(), f()))
+}
+
+fn maybe_capture_failed_qp_transcript(
+    hessian: &DMatrix<f64>,
+    linear_objective: &[f64],
+    constraint_matrix: &DMatrix<f64>,
+    rhs: &[f64],
+    cones: &[clarabel::solver::SupportedConeT<f64>],
+) -> Option<String> {
+    let captured = capture_stdio_output(|| {
+        let Ok(settings) = DefaultSettingsBuilder::default().verbose(true).build() else {
+            return;
+        };
+        let p = dense_to_csc_upper(hessian);
+        let a = dense_to_csc(constraint_matrix);
+        let Ok(mut solver) = DefaultSolver::new(&p, linear_objective, &a, rhs, cones, settings)
+        else {
+            return;
+        };
+        solver.solve();
+    })
+    .ok()?;
+    let transcript = captured.0.trim().to_string();
+    (!transcript.is_empty()).then_some(transcript)
+}
+
+fn build_qp_failure_diagnostics(
+    qp_info: SqpQpInfo,
+    hessian: &DMatrix<f64>,
+    linear_objective: &[f64],
+    constraint_matrix: &DMatrix<f64>,
+    rhs: &[f64],
+    cones: &[clarabel::solver::SupportedConeT<f64>],
+    elastic_recovery: bool,
+) -> SqpQpFailureDiagnostics {
+    let diag_values = (0..hessian.nrows())
+        .map(|idx| hessian[(idx, idx)])
+        .collect::<Vec<_>>();
+    let hessian_diag_min = diag_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let hessian_diag_max = diag_values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    SqpQpFailureDiagnostics {
+        qp_info,
+        variable_count: hessian.nrows(),
+        constraint_count: constraint_matrix.nrows(),
+        linear_objective_inf_norm: inf_norm(linear_objective),
+        rhs_inf_norm: inf_norm(rhs),
+        hessian_diag_min,
+        hessian_diag_max,
+        elastic_recovery,
+        cones: cone_summaries(cones),
+        transcript: maybe_capture_failed_qp_transcript(
+            hessian,
+            linear_objective,
+            constraint_matrix,
+            rhs,
+            cones,
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -905,6 +1333,7 @@ const SQP_EVENT_SEEN_LINE_SEARCH: u8 = 1 << 1;
 const SQP_EVENT_SEEN_QP: u8 = 1 << 2;
 const SQP_EVENT_SEEN_MAX_ITER: u8 = 1 << 3;
 const SQP_EVENT_SEEN_ELASTIC: u8 = 1 << 4;
+const SQP_EVENT_SEEN_WOLFE: u8 = 1 << 5;
 pub(crate) const SQP_LOG_ITERATION_LIMIT_REACHED: u8 = 1 << 0;
 pub(crate) const SQP_LOG_HAS_EQUALITIES: u8 = 1 << 1;
 pub(crate) const SQP_LOG_HAS_INEQUALITIES: u8 = 1 << 2;
@@ -1117,6 +1546,10 @@ fn finalize_profiling(profiling: &mut ClarabelSqpProfiling, solve_started: Insta
         profiling.total_callback_time()
             + profiling.qp_setup_time
             + profiling.qp_solve_time
+            + profiling.multiplier_estimation_time
+            + profiling.line_search_evaluation_time
+            + profiling.line_search_condition_check_time
+            + profiling.convergence_check_time
             + profiling.preprocessing_time,
     );
 }
@@ -1237,6 +1670,10 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
     let timing_unit = choose_summary_duration_unit(&[
         summary.profiling.qp_setup_time,
         summary.profiling.qp_solve_time,
+        summary.profiling.multiplier_estimation_time,
+        summary.profiling.line_search_evaluation_time,
+        summary.profiling.line_search_condition_check_time,
+        summary.profiling.convergence_check_time,
         summary.profiling.preprocessing_time,
         summary.profiling.unaccounted_time,
         summary.profiling.total_time,
@@ -1320,6 +1757,34 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
             "qp solve",
             Some(summary.profiling.qp_solves),
             summary.profiling.qp_solve_time,
+        ),
+    ));
+    lines.push(boxed_line(
+        "",
+        timing_row("mult est", None, summary.profiling.multiplier_estimation_time),
+    ));
+    lines.push(boxed_line(
+        "",
+        timing_row(
+            "ls eval",
+            None,
+            summary.profiling.line_search_evaluation_time,
+        ),
+    ));
+    lines.push(boxed_line(
+        "",
+        timing_row(
+            "ls checks",
+            None,
+            summary.profiling.line_search_condition_check_time,
+        ),
+    ));
+    lines.push(boxed_line(
+        "",
+        timing_row(
+            "conv check",
+            None,
+            summary.profiling.convergence_check_time,
         ),
     ));
     lines.push(boxed_line(
@@ -1413,11 +1878,19 @@ fn log_sqp_problem_header<P>(
         boxed_line(
             "line search",
             format!(
-                "armijo_c1={}  beta={}  min_step={}",
+                "armijo_c1={}  wolfe_c2={}  beta={}  min_step={}",
                 sci_text(options.armijo_c1),
+                options
+                    .wolfe_c2
+                    .map(sci_text)
+                    .unwrap_or_else(|| "--".to_string()),
                 sci_text(options.line_search_beta),
                 sci_text(options.min_step),
             ),
+        ),
+        boxed_line(
+            "",
+            format!("max_line_search_steps={}", options.max_line_search_steps),
         ),
         boxed_line(
             "globalize",
@@ -1510,6 +1983,9 @@ fn fmt_event_codes(snapshot: &SqpIterationSnapshot) -> String {
     if has_event(snapshot, SqpIterationEvent::QpReducedAccuracy) {
         codes.push('R');
     }
+    if has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial) {
+        codes.push('W');
+    }
     if has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed) {
         codes.push('E');
     }
@@ -1530,6 +2006,7 @@ fn style_event_cell(snapshot: &SqpIterationSnapshot) -> String {
     } else if has_event(snapshot, SqpIterationEvent::PenaltyUpdated)
         || has_event(snapshot, SqpIterationEvent::LongLineSearch)
         || has_event(snapshot, SqpIterationEvent::QpReducedAccuracy)
+        || has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial)
         || has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed)
     {
         style_yellow_bold(&cell)
@@ -1555,6 +2032,11 @@ fn event_legend_suffix(snapshot: &SqpIterationSnapshot, state: &mut SqpEventLege
         && state.mark_if_new(SQP_EVENT_SEEN_QP)
     {
         parts.push("R=QP solved to reduced accuracy");
+    }
+    if has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial)
+        && state.mark_if_new(SQP_EVENT_SEEN_WOLFE)
+    {
+        parts.push("W=rejected trial failed Wolfe curvature condition");
     }
     if has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed)
         && state.mark_if_new(SQP_EVENT_SEEN_ELASTIC)
@@ -1671,6 +2153,7 @@ fn validate_finite_scalar_output(
                 final_state: current_state.cloned(),
                 final_state_kind: current_state.map(|_| SqpFinalStateKind::AcceptedIterate),
                 last_accepted_state: last_accepted_state.cloned(),
+                qp_failure: None,
                 profiling: profiling.clone(),
             }),
         })
@@ -1694,6 +2177,7 @@ fn validate_finite_slice_output(
                 final_state: current_state.cloned(),
                 final_state_kind: current_state.map(|_| SqpFinalStateKind::AcceptedIterate),
                 last_accepted_state: last_accepted_state.cloned(),
+                qp_failure: None,
                 profiling: profiling.clone(),
             }),
         })
@@ -1725,6 +2209,7 @@ struct RawQpSolve {
     primal: Vec<f64>,
     dual: Vec<f64>,
     qp_info: SqpQpInfo,
+    qp_failure: Option<SqpQpFailureDiagnostics>,
 }
 
 #[derive(Clone, Debug)]
@@ -1761,6 +2246,7 @@ fn solve_clarabel_qp_from_dense(
     constraint_matrix: &DMatrix<f64>,
     rhs: &[f64],
     cones: &[clarabel::solver::SupportedConeT<f64>],
+    elastic_recovery: bool,
     qp_ctx: &mut QpSolveContext<'_>,
 ) -> std::result::Result<RawQpSolve, ClarabelSqpError> {
     let qp_setup_started = Instant::now();
@@ -1784,15 +2270,29 @@ fn solve_clarabel_qp_from_dense(
     qp_ctx.profiling.qp_solve_time += qp_solve_elapsed;
     *qp_ctx.iteration_qp_solve_time += qp_solve_elapsed;
 
+    let qp_info = qp_status_info(
+        solver.solution.status,
+        qp_setup_elapsed,
+        qp_solve_elapsed,
+        solver.solution.iterations,
+    );
+    let qp_failure = (qp_info.status == SqpQpStatus::Failed).then(|| {
+        build_qp_failure_diagnostics(
+            qp_info.clone(),
+            hessian,
+            linear_objective,
+            constraint_matrix,
+            rhs,
+            cones,
+            elastic_recovery,
+        )
+    });
+
     Ok(RawQpSolve {
         primal: solver.solution.x.clone(),
         dual: solver.solution.z.clone(),
-        qp_info: qp_status_info(
-            solver.solution.status,
-            qp_setup_elapsed,
-            qp_solve_elapsed,
-            solver.solution.iterations,
-        ),
+        qp_info,
+        qp_failure,
     })
 }
 
@@ -1977,6 +2477,7 @@ fn solve_elastic_recovery_qp(
         &constraint_matrix,
         &rhs,
         &cones,
+        true,
         qp_ctx,
     )?;
     qp_ctx.profiling.elastic_recovery_qp_solves += 1;
@@ -2044,6 +2545,9 @@ where
     let mut trial_equality_values = vec![0.0; equality_count];
     let mut trial_inequality_values = vec![0.0; inequality_count];
     let mut trial_augmented_inequality_values = vec![0.0; augmented_inequality_count];
+    let mut trial_gradient = vec![0.0; n];
+    let mut trial_equality_jacobian_values = vec![0.0; problem.equality_jacobian_ccs().nnz()];
+    let mut trial_inequality_jacobian_values = vec![0.0; problem.inequality_jacobian_ccs().nnz()];
     let mut equality_multipliers = vec![0.0; equality_count];
     let mut inequality_multipliers = vec![0.0; inequality_count];
     let mut lower_bound_multipliers = vec![0.0; lower_bound_count];
@@ -2066,9 +2570,14 @@ where
 
     for iteration in 0..options.max_iters {
         let iteration_started = Instant::now();
+        let iteration_timing_baseline = IterationTimingBaseline::capture(&profiling);
         let mut iteration_callback_time = Duration::ZERO;
         let mut iteration_qp_setup_time = Duration::ZERO;
         let mut iteration_qp_solve_time = Duration::ZERO;
+        let mut iteration_multiplier_estimation_time = Duration::ZERO;
+        let mut iteration_line_search_evaluation_time = Duration::ZERO;
+        let mut iteration_line_search_condition_check_time = Duration::ZERO;
+        let mut iteration_convergence_check_time = Duration::ZERO;
         let objective_value = validate_finite_scalar_output(
             time_callback(
                 &mut profiling.objective_value,
@@ -2172,15 +2681,19 @@ where
         let dual_inf = inf_norm(&dual_residual);
         let complementarity_inf =
             complementarity_inf_norm(&augmented_inequality_values, &all_inequality_multipliers);
+        let convergence_check_started = Instant::now();
+        let converged = primal_inf <= options.constraint_tol
+            && dual_inf <= options.dual_tol
+            && complementarity_inf <= options.complementarity_tol;
+        let convergence_check_elapsed = convergence_check_started.elapsed();
+        iteration_convergence_check_time += convergence_check_elapsed;
+        profiling.convergence_check_time += convergence_check_elapsed;
         let preprocess_duration = iteration_started
             .elapsed()
             .saturating_sub(iteration_callback_time);
         let phase = if iteration == 0 {
             SqpIterationPhase::Initial
-        } else if primal_inf <= options.constraint_tol
-            && dual_inf <= options.dual_tol
-            && complementarity_inf <= options.complementarity_tol
-        {
+        } else if converged {
             SqpIterationPhase::PostConvergence
         } else {
             SqpIterationPhase::AcceptedStep
@@ -2198,29 +2711,26 @@ where
             penalty: merit_penalty,
             line_search: previous_line_search.clone(),
             qp: previous_qp.clone(),
-            timing: SqpIterationTiming {
-                objective_value: profiling.objective_value.total_time,
-                objective_gradient: profiling.objective_gradient.total_time,
-                equality_values: profiling.equality_values.total_time,
-                inequality_values: profiling.inequality_values.total_time,
-                equality_jacobian_values: profiling.equality_jacobian_values.total_time,
-                inequality_jacobian_values: profiling.inequality_jacobian_values.total_time,
-                lagrangian_hessian_values: Duration::ZERO,
-                qp_setup: Duration::ZERO,
-                qp_solve: Duration::ZERO,
-                preprocess: preprocess_duration,
-                total: iteration_started.elapsed(),
-            },
+            timing: build_iteration_timing(
+                iteration_timing_baseline,
+                &profiling,
+                IterationTimingBuckets {
+                    multiplier_estimation: iteration_multiplier_estimation_time,
+                    line_search_evaluation: iteration_line_search_evaluation_time,
+                    line_search_condition_checks: iteration_line_search_condition_check_time,
+                    convergence_check: iteration_convergence_check_time,
+                    preprocess: preprocess_duration,
+                    total: iteration_started.elapsed(),
+                    ..IterationTimingBuckets::default()
+                },
+            ),
             events: previous_events.clone(),
         };
         callback(&current_snapshot);
         if options.verbose {
             log_sqp_iteration(&current_snapshot, options, &mut event_state);
         }
-        if primal_inf <= options.constraint_tol
-            && dual_inf <= options.dual_tol
-            && complementarity_inf <= options.complementarity_tol
-        {
+        if converged {
             profiling.preprocessing_time += preprocess_duration;
             finalize_profiling(&mut profiling, solve_started);
             let summary = ClarabelSqpSummary {
@@ -2351,10 +2861,11 @@ where
                     status => {
                         return Err(ClarabelSqpError::QpSolve {
                             status,
-                            context: failure_context(
+                            context: failure_context_with_qp_failure(
                                 SqpTermination::QpSolve,
                                 Some(current_snapshot.clone()),
                                 last_accepted_state.clone(),
+                                elastic_qp.qp_failure,
                                 &profiling,
                             ),
                         });
@@ -2367,6 +2878,7 @@ where
                     &stacked_jacobian,
                     &rhs,
                     &cones,
+                    false,
                     &mut qp_ctx,
                 )?;
                 match normal_qp.qp_info.raw_status {
@@ -2401,10 +2913,11 @@ where
                             status => {
                                 return Err(ClarabelSqpError::QpSolve {
                                     status,
-                                    context: failure_context(
+                                    context: failure_context_with_qp_failure(
                                         SqpTermination::QpSolve,
                                         Some(current_snapshot.clone()),
                                         last_accepted_state.clone(),
+                                        elastic_qp.qp_failure,
                                         &profiling,
                                     ),
                                 });
@@ -2414,10 +2927,11 @@ where
                     status => {
                         return Err(ClarabelSqpError::QpSolve {
                             status,
-                            context: failure_context(
+                            context: failure_context_with_qp_failure(
                                 SqpTermination::QpSolve,
                                 Some(current_snapshot.clone()),
                                 last_accepted_state.clone(),
+                                normal_qp.qp_failure,
                                 &profiling,
                             ),
                         });
@@ -2427,6 +2941,7 @@ where
         };
         let current_qp = (total_constraint_count > 0).then_some(current_qp_info);
 
+        let multiplier_estimation_started = Instant::now();
         let candidate_all_inequality_multipliers = [
             candidate_inequality_multipliers.as_slice(),
             candidate_lower_bound_multipliers.as_slice(),
@@ -2444,10 +2959,19 @@ where
             &augmented_inequality_values,
             &candidate_all_inequality_multipliers,
         );
-        if primal_inf <= options.constraint_tol
+        let multiplier_estimation_elapsed = multiplier_estimation_started.elapsed();
+        iteration_multiplier_estimation_time += multiplier_estimation_elapsed;
+        profiling.multiplier_estimation_time += multiplier_estimation_elapsed;
+
+        let convergence_check_started = Instant::now();
+        let candidate_converged = primal_inf <= options.constraint_tol
             && candidate_dual_inf <= options.dual_tol
-            && candidate_complementarity_inf <= options.complementarity_tol
-        {
+            && candidate_complementarity_inf <= options.complementarity_tol;
+        let convergence_check_elapsed = convergence_check_started.elapsed();
+        iteration_convergence_check_time += convergence_check_elapsed;
+        profiling.convergence_check_time += convergence_check_elapsed;
+
+        if candidate_converged {
             let post_convergence_state = SqpIterationSnapshot {
                 iteration,
                 phase: SqpIterationPhase::PostConvergence,
@@ -2461,22 +2985,24 @@ where
                 penalty: merit_penalty,
                 line_search: None,
                 qp: current_qp.clone(),
-                timing: SqpIterationTiming {
-                    objective_value: current_snapshot.timing.objective_value,
-                    objective_gradient: current_snapshot.timing.objective_gradient,
-                    equality_values: current_snapshot.timing.equality_values,
-                    inequality_values: current_snapshot.timing.inequality_values,
-                    equality_jacobian_values: current_snapshot.timing.equality_jacobian_values,
-                    inequality_jacobian_values: current_snapshot.timing.inequality_jacobian_values,
-                    lagrangian_hessian_values: profiling.lagrangian_hessian_values.total_time,
-                    qp_setup: iteration_qp_setup_time,
-                    qp_solve: iteration_qp_solve_time,
-                    preprocess: Duration::ZERO,
-                    total: iteration_started.elapsed(),
-                },
+                timing: build_iteration_timing(
+                    iteration_timing_baseline,
+                    &profiling,
+                    IterationTimingBuckets {
+                        qp_setup: iteration_qp_setup_time,
+                        qp_solve: iteration_qp_solve_time,
+                        multiplier_estimation: iteration_multiplier_estimation_time,
+                        line_search_evaluation: iteration_line_search_evaluation_time,
+                        line_search_condition_checks: iteration_line_search_condition_check_time,
+                        convergence_check: iteration_convergence_check_time,
+                        total: iteration_started.elapsed(),
+                        ..IterationTimingBuckets::default()
+                    },
+                ),
                 events: snapshot_events(
                     false,
                     None,
+                    false,
                     current_qp.as_ref(),
                     elastic_recovery_used,
                     false,
@@ -2594,13 +3120,18 @@ where
         let mut accepted_trial = None;
         let mut line_search_iterations = 0;
         let mut last_tried_alpha = alpha;
-        while alpha * step_inf_norm >= options.min_step {
+        let mut rejected_trials = Vec::new();
+        let mut wolfe_rejected = false;
+        while alpha * step_inf_norm >= options.min_step
+            && line_search_iterations <= options.max_line_search_steps
+        {
             let trial = x
                 .iter()
                 .zip(step.iter())
                 .map(|(xi, di)| xi + alpha * di)
                 .collect::<Vec<_>>();
-            let trial_merit_value = trial_merit(
+            let line_search_eval_started = Instant::now();
+            let trial_eval = trial_merit(
                 problem,
                 &trial,
                 parameters,
@@ -2622,18 +3153,91 @@ where
                     &profiling,
                 ),
             })?;
-            if trial_merit_value
-                <= current_merit + options.armijo_c1 * alpha * directional_derivative
-            {
-                accepted_trial = Some(trial);
+            let trial_directional_derivative = options
+                .wolfe_c2
+                .map(|_| {
+                    trial_merit_directional_derivative(
+                        problem,
+                        TrialDerivativeRequest {
+                            x: &trial,
+                            parameters,
+                            step: &step,
+                            equality_values: &trial_equality_values,
+                            augmented_inequality_values: &trial_augmented_inequality_values,
+                            penalty: merit_penalty,
+                        },
+                        &mut profiling,
+                        &mut iteration_callback_time,
+                        TrialDerivativeWorkspace {
+                            trial_gradient: &mut trial_gradient,
+                            trial_equality_jacobian_values: &mut trial_equality_jacobian_values,
+                            trial_inequality_jacobian_values: &mut trial_inequality_jacobian_values,
+                            bound_jacobian: &bound_jacobian,
+                        },
+                    )
+                })
+                .transpose()
+                .map_err(|stage| ClarabelSqpError::NonFiniteCallbackOutput {
+                    stage,
+                    context: failure_context(
+                        SqpTermination::NonFiniteCallbackOutput,
+                        Some(current_snapshot.clone()),
+                        last_accepted_state.clone(),
+                        &profiling,
+                    ),
+                })?;
+            let line_search_eval_elapsed = line_search_eval_started.elapsed();
+            iteration_line_search_evaluation_time += line_search_eval_elapsed;
+            profiling.line_search_evaluation_time += line_search_eval_elapsed;
+
+            let line_search_check_started = Instant::now();
+            let armijo_rhs = current_merit + options.armijo_c1 * alpha * directional_derivative;
+            // Numerical noise can dominate the predicted decrease once the QP step and
+            // directional derivative are both near machine precision. Allow a tiny absolute
+            // slack so nearly-converged steps do not fail Armijo purely from rounding.
+            let armijo_abs_tol = current_merit.abs().max(1.0) * 1e-12;
+            let armijo_satisfied = trial_eval.merit <= armijo_rhs + armijo_abs_tol;
+            let wolfe_satisfied = options.wolfe_c2.map(|c2| {
+                trial_directional_derivative
+                    .expect("wolfe_c2 implies a trial directional derivative")
+                    >= c2 * directional_derivative
+            });
+            let violation_satisfied = trial_eval.primal_inf <= primal_inf.max(options.constraint_tol);
+            let line_search_check_elapsed = line_search_check_started.elapsed();
+            iteration_line_search_condition_check_time += line_search_check_elapsed;
+            profiling.line_search_condition_check_time += line_search_check_elapsed;
+
+            if armijo_satisfied && wolfe_satisfied.unwrap_or(true) {
+                accepted_trial = Some((
+                    trial,
+                    trial_eval,
+                    armijo_satisfied,
+                    wolfe_satisfied,
+                    violation_satisfied,
+                ));
                 last_tried_alpha = alpha;
                 break;
             }
+            if wolfe_satisfied == Some(false) {
+                wolfe_rejected = true;
+            }
+            rejected_trials.push(SqpLineSearchTrial {
+                alpha,
+                objective: trial_eval.objective,
+                merit: trial_eval.merit,
+                eq_inf: trial_eval.eq_inf,
+                ineq_inf: trial_eval.ineq_inf,
+                armijo_satisfied,
+                wolfe_satisfied,
+                violation_satisfied,
+            });
             last_tried_alpha = alpha;
             alpha *= options.line_search_beta;
             line_search_iterations += 1;
         }
-        let Some(trial) = accepted_trial else {
+        let Some((trial, accepted_eval, armijo_satisfied, wolfe_satisfied, violation_satisfied)) =
+            accepted_trial
+        else {
             return Err(ClarabelSqpError::LineSearchFailed {
                 directional_derivative,
                 step_inf_norm,
@@ -2646,9 +3250,7 @@ where
                 ),
             });
         };
-        let accepted_equality_inf = inf_norm(&trial_equality_values);
-        let accepted_inequality_inf = positive_part_inf_norm(&trial_augmented_inequality_values);
-        let accepted_primal_inf = accepted_equality_inf.max(accepted_inequality_inf);
+        let accepted_primal_inf = accepted_eval.primal_inf;
 
         profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
             iteration_callback_time + iteration_qp_setup_time + iteration_qp_solve_time,
@@ -2663,6 +3265,10 @@ where
             accepted_alpha: alpha,
             last_tried_alpha,
             backtrack_count: line_search_iterations,
+            armijo_satisfied,
+            wolfe_satisfied,
+            violation_satisfied,
+            rejected_trials,
         });
         previous_qp = current_qp;
         previous_elastic_recovery_used = elastic_recovery_used;
@@ -2689,6 +3295,7 @@ where
         previous_events = snapshot_events(
             penalty_updated,
             Some(line_search_iterations),
+            wolfe_rejected,
             previous_qp.as_ref(),
             previous_elastic_recovery_used,
             false,
@@ -2698,6 +3305,7 @@ where
 
     let max_iteration = options.max_iters;
     let iteration_started = Instant::now();
+    let iteration_timing_baseline = IterationTimingBaseline::capture(&profiling);
     let mut iteration_callback_time = Duration::ZERO;
     time_callback(
         &mut profiling.objective_gradient,
@@ -2785,7 +3393,7 @@ where
     )?;
     let equality_inf = inf_norm(&equality_values);
     let inequality_inf = positive_part_inf_norm(&augmented_inequality_values);
-    let _primal_inf = equality_inf.max(inequality_inf);
+    let _final_primal_inf = equality_inf.max(inequality_inf);
     let all_inequality_multipliers = [
         inequality_multipliers.as_slice(),
         lower_bound_multipliers.as_slice(),
@@ -2814,26 +3422,27 @@ where
         penalty: merit_penalty,
         line_search: previous_line_search.clone(),
         qp: previous_qp.clone(),
-        timing: SqpIterationTiming {
-            objective_value: profiling.objective_value.total_time,
-            objective_gradient: profiling.objective_gradient.total_time,
-            equality_values: profiling.equality_values.total_time,
-            inequality_values: profiling.inequality_values.total_time,
-            equality_jacobian_values: profiling.equality_jacobian_values.total_time,
-            inequality_jacobian_values: profiling.inequality_jacobian_values.total_time,
-            lagrangian_hessian_values: profiling.lagrangian_hessian_values.total_time,
-            qp_setup: Duration::ZERO,
-            qp_solve: Duration::ZERO,
-            preprocess: iteration_started
-                .elapsed()
-                .saturating_sub(iteration_callback_time),
-            total: iteration_started.elapsed(),
-        },
+        timing: build_iteration_timing(
+            iteration_timing_baseline,
+            &profiling,
+            IterationTimingBuckets {
+                preprocess: iteration_started
+                    .elapsed()
+                    .saturating_sub(iteration_callback_time),
+                total: iteration_started.elapsed(),
+                ..IterationTimingBuckets::default()
+            },
+        ),
         events: snapshot_events(
             false,
             previous_line_search
                 .as_ref()
                 .map(|info| info.backtrack_count),
+            previous_line_search.as_ref().is_some_and(|info| {
+                info.rejected_trials
+                    .iter()
+                    .any(|trial| trial.wolfe_satisfied == Some(false))
+            }),
             previous_qp.as_ref(),
             previous_elastic_recovery_used,
             true,

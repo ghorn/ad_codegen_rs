@@ -100,34 +100,36 @@ pub(crate) fn all_cases() -> Vec<ProblemCase> {
     cases
 }
 
-pub(crate) struct TypedProblemData<X, P, C>
+pub(crate) struct TypedProblemData<X, P, E, I>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
 {
-    pub(crate) compiled: TypedCompiledJitNlp<X, P, C>,
+    pub(crate) compiled: TypedCompiledJitNlp<X, P, E, I>,
     pub(crate) x0: <X as Vectorize<SX>>::Rebind<f64>,
     pub(crate) parameters: <P as Vectorize<SX>>::Rebind<f64>,
-    pub(crate) bounds: TypedRuntimeNlpBounds<X, C>,
+    pub(crate) bounds: TypedRuntimeNlpBounds<X, I>,
 }
 
-pub(crate) fn symbolic_compile<X, P, C, F>(
+pub(crate) fn symbolic_compile<X, P, E, I, F>(
     name: &str,
     model: F,
     options: ProblemRunOptions,
-) -> anyhow::Result<TypedCompiledJitNlp<X, P, C>>
+) -> anyhow::Result<TypedCompiledJitNlp<X, P, E, I>>
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
-    F: FnOnce(&X, &P) -> SymbolicNlpOutputs<C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
+    F: FnOnce(&X, &P) -> SymbolicNlpOutputs<E, I>,
 {
-    Ok(optimization::symbolic_nlp::<X, P, C, _>(name, model)?
+    Ok(optimization::symbolic_nlp::<X, P, E, I, _>(name, model)?
         .compile_jit_with_opt_level(to_llvm_opt_level(options.jit_opt_level))?)
 }
 
-pub(crate) fn make_typed_case<X, P, C, Build, Validate>(
+pub(crate) fn make_typed_case<X, P, E, I, Build, Validate>(
     metadata: CaseMetadata,
     build: Build,
     validate: Validate,
@@ -135,12 +137,16 @@ pub(crate) fn make_typed_case<X, P, C, Build, Validate>(
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
-    <C as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     Build:
-        Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, C>> + Send + Sync + 'static,
+        Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>
+            + Send
+            + Sync
+            + 'static,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome + Send + Sync + 'static,
 {
     ProblemCase {
@@ -164,7 +170,7 @@ where
     }
 }
 
-fn run_typed_case<X, P, C, Build, Validate>(
+fn run_typed_case<X, P, E, I, Build, Validate>(
     solver: SolverKind,
     options: ProblemRunOptions,
     max_iters_limit: usize,
@@ -176,11 +182,12 @@ fn run_typed_case<X, P, C, Build, Validate>(
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
-    <C as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
-    Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, C>>,
+    <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
 {
     let total_started = Instant::now();
@@ -239,13 +246,13 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_built_case<X, P, C, Validate>(
+fn run_built_case<X, P, E, I, Validate>(
     solver: SolverKind,
     options: ProblemRunOptions,
     max_iters_limit: usize,
     expected: KnownStatus,
     metadata: CaseMetadata,
-    data: &TypedProblemData<X, P, C>,
+    data: &TypedProblemData<X, P, E, I>,
     compile_wall_time: std::time::Duration,
     total_started: Instant,
     validate: &Validate,
@@ -253,10 +260,11 @@ fn run_built_case<X, P, C, Validate>(
 where
     X: Vectorize<SX, Rebind<SX> = X>,
     P: Vectorize<SX, Rebind<SX> = P>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    E: Vectorize<SX, Rebind<SX> = E>,
+    I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
-    <C as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
+    <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome,
 {
     let backend_timing = data.compiled.backend_timing_metadata();
@@ -325,7 +333,7 @@ where
                 &data.parameters,
                 &data.bounds,
                 &sqp_options,
-                |snapshot| snapshots.push(snapshot.clone()),
+                |snapshot: &SqpIterationSnapshot| snapshots.push(snapshot.clone()),
             );
             let solve_wall_time = solve_started.elapsed();
             match result {
@@ -418,7 +426,7 @@ where
                 &data.parameters,
                 &data.bounds,
                 &interior_point_options,
-                |snapshot| snapshots.push(snapshot.clone()),
+                |snapshot: &InteriorPointIterationSnapshot| snapshots.push(snapshot.clone()),
             );
             let solve_wall_time = solve_started.elapsed();
             match result {
@@ -653,16 +661,16 @@ fn format_ipopt_thresholds(options: &IpoptOptions) -> String {
     )
 }
 
-fn describe_problem<X, C>(
+fn describe_problem<X, I>(
     metadata: CaseMetadata,
     problem: &impl CompiledNlpProblem,
-    bounds: &TypedRuntimeNlpBounds<X, C>,
+    bounds: &TypedRuntimeNlpBounds<X, I>,
 ) -> ProblemDescriptor
 where
     X: Vectorize<SX, Rebind<SX> = X>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
-    <C as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
+    <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
 {
     let num_vars = problem.dimension();
     let num_eq = problem.equality_count();
@@ -685,10 +693,10 @@ where
     }
 }
 
-fn box_counts<X, C>(bounds: &TypedRuntimeNlpBounds<X, C>) -> (usize, usize)
+fn box_counts<X, I>(bounds: &TypedRuntimeNlpBounds<X, I>) -> (usize, usize)
 where
     X: Vectorize<SX, Rebind<SX> = X>,
-    C: Vectorize<SX, Rebind<SX> = C>,
+    I: Vectorize<SX, Rebind<SX> = I>,
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64>,
 {
     let lower = bounds
@@ -963,6 +971,18 @@ fn render_sqp_transcript(
     summary: Option<&ClarabelSqpSummary>,
     error: Option<&ClarabelSqpError>,
 ) -> String {
+    fn fmt_bool(value: bool) -> &'static str {
+        if value { "yes" } else { "no" }
+    }
+
+    fn fmt_opt_bool(value: Option<bool>) -> &'static str {
+        match value {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "--",
+        }
+    }
+
     let mut out = render_problem_header(record);
     out.push_str("solver_log\n\n");
     let header = format!(
@@ -1011,6 +1031,7 @@ fn render_sqp_transcript(
                     optimization::SqpIterationEvent::LongLineSearch => 'L',
                     optimization::SqpIterationEvent::QpReducedAccuracy => 'R',
                     optimization::SqpIterationEvent::ElasticRecoveryUsed => 'E',
+                    optimization::SqpIterationEvent::WolfeRejectedTrial => 'W',
                     optimization::SqpIterationEvent::MaxIterationsReached => 'M',
                 })
                 .collect()
@@ -1039,6 +1060,45 @@ fn render_sqp_transcript(
             events,
         );
     }
+    let detailed_line_search = snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            snapshot
+                .line_search
+                .as_ref()
+                .filter(|info| !info.rejected_trials.is_empty() || info.wolfe_satisfied.is_some())
+                .map(|info| (snapshot, info))
+        })
+        .collect::<Vec<_>>();
+    if !detailed_line_search.is_empty() {
+        out.push_str("\nline_search_detail\n\n");
+        for (snapshot, info) in detailed_line_search {
+            let _ = writeln!(
+                out,
+                "iter {}: accepted alpha={} armijo={} wolfe={} violation={} rejected={}",
+                snapshot.iteration,
+                fmt_sci(info.accepted_alpha),
+                fmt_bool(info.armijo_satisfied),
+                fmt_opt_bool(info.wolfe_satisfied),
+                fmt_bool(info.violation_satisfied),
+                info.rejected_trials.len(),
+            );
+            for trial in &info.rejected_trials {
+                let _ = writeln!(
+                    out,
+                    "  reject alpha={} merit={} obj={} eq_inf={} ineq_inf={} armijo={} wolfe={} violation={}",
+                    fmt_sci(trial.alpha),
+                    fmt_sci(trial.merit),
+                    fmt_sci(trial.objective),
+                    fmt_opt_sci(trial.eq_inf),
+                    fmt_opt_sci(trial.ineq_inf),
+                    fmt_bool(trial.armijo_satisfied),
+                    fmt_opt_bool(trial.wolfe_satisfied),
+                    fmt_bool(trial.violation_satisfied),
+                );
+            }
+        }
+    }
     if let Some(summary) = summary {
         let _ = writeln!(out, "\ntermination: {:?}", summary.termination);
         let _ = writeln!(out, "final_state_kind: {:?}", summary.final_state_kind);
@@ -1046,6 +1106,45 @@ fn render_sqp_transcript(
     if let Some(error) = error {
         let _ = writeln!(out, "\ntermination: error");
         let _ = writeln!(out, "error_kind: {}", sqp_error_code(error));
+        if let ClarabelSqpError::QpSolve { context, .. } = error
+            && let Some(qp_failure) = &context.qp_failure
+        {
+            out.push_str("\nqp_failure\n\n");
+            let _ = writeln!(out, "status: {:?}", qp_failure.qp_info.raw_status);
+            let _ = writeln!(
+                out,
+                "dims: vars={} constraints={}",
+                qp_failure.variable_count,
+                qp_failure.constraint_count
+            );
+            let _ = writeln!(
+                out,
+                "objective_inf={} rhs_inf={}",
+                fmt_sci(qp_failure.linear_objective_inf_norm),
+                fmt_sci(qp_failure.rhs_inf_norm),
+            );
+            let _ = writeln!(
+                out,
+                "hessian_diag=[{}, {}] elastic_recovery={}",
+                fmt_sci(qp_failure.hessian_diag_min),
+                fmt_sci(qp_failure.hessian_diag_max),
+                fmt_bool(qp_failure.elastic_recovery),
+            );
+            let cones = qp_failure
+                .cones
+                .iter()
+                .map(|cone| format!("{}:{}", cone.kind, cone.dim))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(out, "cones: {}", if cones.is_empty() { "--" } else { &cones });
+            if let Some(transcript) = &qp_failure.transcript {
+                let _ = writeln!(out, "\nclarabel_qp_transcript\n");
+                out.push_str(transcript);
+                if !transcript.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        }
     }
     out.push_str(&render_problem_footer(record));
     out

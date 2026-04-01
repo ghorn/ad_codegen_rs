@@ -6,7 +6,7 @@ use crate::model::{ProblemRunRecord, ValidationOutcome, ValidationTier};
 use super::{CaseMetadata, Pair, ProblemCase, make_typed_case, symbolic_compile};
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<Pair<SX>, (), SX, _, _>(
+    make_typed_case::<Pair<SX>, (), (), SX, _, _>(
         CaseMetadata::new(
             "disk_rosenbrock",
             "disk_rosenbrock",
@@ -16,11 +16,12 @@ pub(crate) fn case() -> ProblemCase {
             false,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<Pair<SX>, (), SX, _>(
+            let compiled = symbolic_compile::<Pair<SX>, (), (), SX, _>(
                 "disk_rosenbrock",
                 |x, ()| SymbolicNlpOutputs {
                     objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-                    constraints: x.x.sqr() + x.y.sqr(),
+                    equalities: (),
+                    inequalities: x.x.sqr() + x.y.sqr(),
                 },
                 jit_opt_level,
             )?;
@@ -34,8 +35,8 @@ pub(crate) fn case() -> ProblemCase {
                         x: f64::INFINITY,
                         y: 2.0,
                     }),
-                    constraint_lower: Some(-f64::INFINITY),
-                    constraint_upper: Some(1.5),
+                    inequality_lower: Some(-f64::INFINITY),
+                    inequality_upper: Some(1.5),
                 },
             })
         },

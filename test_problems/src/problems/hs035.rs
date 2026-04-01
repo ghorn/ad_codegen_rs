@@ -6,7 +6,7 @@ use super::{
 };
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<VecN<SX, 3>, (), SX, _, _>(
+    make_typed_case::<VecN<SX, 3>, (), (), SX, _, _>(
         CaseMetadata::new(
             "hs035",
             "hock_schittkowski",
@@ -16,7 +16,7 @@ pub(crate) fn case() -> ProblemCase {
             false,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<VecN<SX, 3>, (), SX, _>(
+            let compiled = symbolic_compile::<VecN<SX, 3>, (), (), SX, _>(
                 "hs035",
                 |x, ()| {
                     let x0 = x.values[0];
@@ -29,7 +29,8 @@ pub(crate) fn case() -> ProblemCase {
                             + x2.sqr()
                             + 2.0 * x0 * x1
                             + 2.0 * x0 * x2,
-                        constraints: x0 + x1 + 2.0 * x2 - 3.0,
+                        equalities: (),
+                        inequalities: x0 + x1 + 2.0 * x2 - 3.0,
                     }
                 },
                 jit_opt_level,
@@ -45,8 +46,8 @@ pub(crate) fn case() -> ProblemCase {
                         values: [0.0, 0.0, 0.0],
                     }),
                     variable_upper: None,
-                    constraint_lower: Some(-f64::INFINITY),
-                    constraint_upper: Some(0.0),
+                    inequality_lower: Some(-f64::INFINITY),
+                    inequality_upper: Some(0.0),
                 },
             })
         },

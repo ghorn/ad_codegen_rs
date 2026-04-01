@@ -15,7 +15,7 @@ pub(crate) fn cases() -> Vec<ProblemCase> {
 }
 
 fn rosenbrock_case<const N: usize>(id: &'static str, variant: &'static str) -> ProblemCase {
-    make_typed_case::<VecN<SX, N>, (), (), _, _>(
+    make_typed_case::<VecN<SX, N>, (), (), (), _, _>(
         CaseMetadata::new(
             id,
             "generalized_rosenbrock",
@@ -25,7 +25,7 @@ fn rosenbrock_case<const N: usize>(id: &'static str, variant: &'static str) -> P
             true,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<VecN<SX, N>, (), (), _>(
+            let compiled = symbolic_compile::<VecN<SX, N>, (), (), (), _>(
                 id,
                 |x, ()| {
                     let objective = x.values.windows(2).fold(SX::zero(), |acc, pair| {
@@ -33,7 +33,8 @@ fn rosenbrock_case<const N: usize>(id: &'static str, variant: &'static str) -> P
                     });
                     SymbolicNlpOutputs {
                         objective,
-                        constraints: (),
+                        equalities: (),
+                        inequalities: (),
                     }
                 },
                 jit_opt_level,

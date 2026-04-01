@@ -6,10 +6,10 @@ use super::{
 };
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<VecN<SX, 4>, (), (), _, _>(
+    make_typed_case::<VecN<SX, 4>, (), (), (), _, _>(
         CaseMetadata::new("wood_4", "wood", "n=4", "manual", "Wood function", false),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<VecN<SX, 4>, (), (), _>(
+            let compiled = symbolic_compile::<VecN<SX, 4>, (), (), (), _>(
                 "wood_4",
                 |x, ()| {
                     let x1 = x.values[0];
@@ -24,7 +24,8 @@ pub(crate) fn case() -> ProblemCase {
                         + 19.8 * (x2 - 1.0) * (x4 - 1.0);
                     SymbolicNlpOutputs {
                         objective,
-                        constraints: (),
+                        equalities: (),
+                        inequalities: (),
                     }
                 },
                 jit_opt_level,

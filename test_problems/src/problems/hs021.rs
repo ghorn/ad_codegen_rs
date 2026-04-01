@@ -6,7 +6,7 @@ use super::{
 };
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<Pair<SX>, (), SX, _, _>(
+    make_typed_case::<Pair<SX>, (), (), SX, _, _>(
         CaseMetadata::new(
             "hs021",
             "hock_schittkowski",
@@ -16,11 +16,12 @@ pub(crate) fn case() -> ProblemCase {
             false,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<Pair<SX>, (), SX, _>(
+            let compiled = symbolic_compile::<Pair<SX>, (), (), SX, _>(
                 "hs021",
                 |x, ()| SymbolicNlpOutputs {
                     objective: 0.01 * x.x.sqr() + x.y.sqr() - 100.0,
-                    constraints: -10.0 * x.x + x.y + 10.0,
+                    equalities: (),
+                    inequalities: -10.0 * x.x + x.y + 10.0,
                 },
                 jit_opt_level,
             )?;
@@ -31,8 +32,8 @@ pub(crate) fn case() -> ProblemCase {
                 bounds: TypedRuntimeNlpBounds {
                     variable_lower: Some(Pair { x: 2.0, y: -50.0 }),
                     variable_upper: Some(Pair { x: 50.0, y: 50.0 }),
-                    constraint_lower: Some(-f64::INFINITY),
-                    constraint_upper: Some(0.0),
+                    inequality_lower: Some(-f64::INFINITY),
+                    inequality_upper: Some(0.0),
                 },
             })
         },

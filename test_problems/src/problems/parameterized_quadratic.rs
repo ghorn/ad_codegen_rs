@@ -6,7 +6,7 @@ use super::{
 };
 
 pub(crate) fn case() -> ProblemCase {
-    make_typed_case::<Pair<SX>, Pair<SX>, SX, _, _>(
+    make_typed_case::<Pair<SX>, Pair<SX>, SX, (), _, _>(
         CaseMetadata::new(
             "parameterized_quadratic",
             "parameterized_quadratic",
@@ -16,11 +16,12 @@ pub(crate) fn case() -> ProblemCase {
             true,
         ),
         |jit_opt_level| {
-            let compiled = symbolic_compile::<Pair<SX>, Pair<SX>, SX, _>(
+            let compiled = symbolic_compile::<Pair<SX>, Pair<SX>, SX, (), _>(
                 "parameterized_quadratic",
                 |x, p| SymbolicNlpOutputs {
                     objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
-                    constraints: x.x + x.y,
+                    equalities: x.x + x.y,
+                    inequalities: (),
                 },
                 jit_opt_level,
             )?;
@@ -31,8 +32,8 @@ pub(crate) fn case() -> ProblemCase {
                 bounds: TypedRuntimeNlpBounds {
                     variable_lower: None,
                     variable_upper: None,
-                    constraint_lower: Some(1.0),
-                    constraint_upper: Some(1.0),
+                    inequality_lower: None,
+                    inequality_upper: None,
                 },
             })
         },
