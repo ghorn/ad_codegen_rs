@@ -1029,6 +1029,7 @@ fn render_sqp_transcript(
                 .map(|event| match event {
                     optimization::SqpIterationEvent::PenaltyUpdated => 'P',
                     optimization::SqpIterationEvent::LongLineSearch => 'L',
+                    optimization::SqpIterationEvent::ArmijoToleranceAdjusted => 'A',
                     optimization::SqpIterationEvent::QpReducedAccuracy => 'R',
                     optimization::SqpIterationEvent::ElasticRecoveryUsed => 'E',
                     optimization::SqpIterationEvent::WolfeRejectedTrial => 'W',
@@ -1075,10 +1076,11 @@ fn render_sqp_transcript(
         for (snapshot, info) in detailed_line_search {
             let _ = writeln!(
                 out,
-                "iter {}: accepted alpha={} armijo={} wolfe={} violation={} rejected={}",
+                "iter {}: accepted alpha={} armijo={} armijo_adj={} wolfe={} violation={} rejected={}",
                 snapshot.iteration,
                 fmt_sci(info.accepted_alpha),
                 fmt_bool(info.armijo_satisfied),
+                fmt_bool(info.armijo_tolerance_adjusted),
                 fmt_opt_bool(info.wolfe_satisfied),
                 fmt_bool(info.violation_satisfied),
                 info.rejected_trials.len(),
@@ -1086,13 +1088,14 @@ fn render_sqp_transcript(
             for trial in &info.rejected_trials {
                 let _ = writeln!(
                     out,
-                    "  reject alpha={} merit={} obj={} eq_inf={} ineq_inf={} armijo={} wolfe={} violation={}",
+                    "  reject alpha={} merit={} obj={} eq_inf={} ineq_inf={} armijo={} armijo_adj={} wolfe={} violation={}",
                     fmt_sci(trial.alpha),
                     fmt_sci(trial.merit),
                     fmt_sci(trial.objective),
                     fmt_opt_sci(trial.eq_inf),
                     fmt_opt_sci(trial.ineq_inf),
                     fmt_bool(trial.armijo_satisfied),
+                    fmt_bool(trial.armijo_tolerance_adjusted),
                     fmt_opt_bool(trial.wolfe_satisfied),
                     fmt_bool(trial.violation_satisfied),
                 );

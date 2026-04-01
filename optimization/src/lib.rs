@@ -293,6 +293,7 @@ pub enum SqpIterationPhase {
 pub enum SqpIterationEvent {
     PenaltyUpdated,
     LongLineSearch,
+    ArmijoToleranceAdjusted,
     QpReducedAccuracy,
     ElasticRecoveryUsed,
     WolfeRejectedTrial,
@@ -368,6 +369,7 @@ pub struct SqpLineSearchTrial {
     pub eq_inf: Option<f64>,
     pub ineq_inf: Option<f64>,
     pub armijo_satisfied: bool,
+    pub armijo_tolerance_adjusted: bool,
     pub wolfe_satisfied: Option<bool>,
     pub violation_satisfied: bool,
 }
@@ -378,6 +380,7 @@ pub struct SqpLineSearchInfo {
     pub last_tried_alpha: f64,
     pub backtrack_count: Index,
     pub armijo_satisfied: bool,
+    pub armijo_tolerance_adjusted: bool,
     pub wolfe_satisfied: Option<bool>,
     pub violation_satisfied: bool,
     pub rejected_trials: Vec<SqpLineSearchTrial>,
@@ -987,6 +990,7 @@ where
 fn snapshot_events(
     penalty_updated: bool,
     line_search_backtracks: Option<Index>,
+    armijo_tolerance_adjusted: bool,
     wolfe_rejected: bool,
     qp_info: Option<&SqpQpInfo>,
     elastic_recovery_used: bool,
@@ -998,6 +1002,9 @@ fn snapshot_events(
     }
     if matches!(line_search_backtracks, Some(iterations) if iterations >= 4) {
         events.push(SqpIterationEvent::LongLineSearch);
+    }
+    if armijo_tolerance_adjusted {
+        events.push(SqpIterationEvent::ArmijoToleranceAdjusted);
     }
     if wolfe_rejected {
         events.push(SqpIterationEvent::WolfeRejectedTrial);
@@ -1334,6 +1341,7 @@ const SQP_EVENT_SEEN_QP: u8 = 1 << 2;
 const SQP_EVENT_SEEN_MAX_ITER: u8 = 1 << 3;
 const SQP_EVENT_SEEN_ELASTIC: u8 = 1 << 4;
 const SQP_EVENT_SEEN_WOLFE: u8 = 1 << 5;
+const SQP_EVENT_SEEN_ARMIJO_ADJUST: u8 = 1 << 6;
 pub(crate) const SQP_LOG_ITERATION_LIMIT_REACHED: u8 = 1 << 0;
 pub(crate) const SQP_LOG_HAS_EQUALITIES: u8 = 1 << 1;
 pub(crate) const SQP_LOG_HAS_INEQUALITIES: u8 = 1 << 2;
@@ -1980,6 +1988,9 @@ fn fmt_event_codes(snapshot: &SqpIterationSnapshot) -> String {
     if has_event(snapshot, SqpIterationEvent::LongLineSearch) {
         codes.push('L');
     }
+    if has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted) {
+        codes.push('A');
+    }
     if has_event(snapshot, SqpIterationEvent::QpReducedAccuracy) {
         codes.push('R');
     }
@@ -2005,6 +2016,7 @@ fn style_event_cell(snapshot: &SqpIterationSnapshot) -> String {
         style_red_bold(&cell)
     } else if has_event(snapshot, SqpIterationEvent::PenaltyUpdated)
         || has_event(snapshot, SqpIterationEvent::LongLineSearch)
+        || has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted)
         || has_event(snapshot, SqpIterationEvent::QpReducedAccuracy)
         || has_event(snapshot, SqpIterationEvent::WolfeRejectedTrial)
         || has_event(snapshot, SqpIterationEvent::ElasticRecoveryUsed)
@@ -2027,6 +2039,11 @@ fn event_legend_suffix(snapshot: &SqpIterationSnapshot, state: &mut SqpEventLege
         && state.mark_if_new(SQP_EVENT_SEEN_LINE_SEARCH)
     {
         parts.push("L=line search backtracked >=4 times");
+    }
+    if has_event(snapshot, SqpIterationEvent::ArmijoToleranceAdjusted)
+        && state.mark_if_new(SQP_EVENT_SEEN_ARMIJO_ADJUST)
+    {
+        parts.push("A=Armijo accepted using numerical tolerance slack");
     }
     if has_event(snapshot, SqpIterationEvent::QpReducedAccuracy)
         && state.mark_if_new(SQP_EVENT_SEEN_QP)
@@ -3000,11 +3017,20 @@ where
                     },
                 ),
                 events: snapshot_events(
-                    false,
-                    None,
-                    false,
+                    previous_events.contains(&SqpIterationEvent::PenaltyUpdated),
+                    previous_line_search
+                        .as_ref()
+                        .map(|info| info.backtrack_count),
+                    previous_line_search
+                        .as_ref()
+                        .is_some_and(|info| info.armijo_tolerance_adjusted),
+                    previous_line_search.as_ref().is_some_and(|info| {
+                        info.rejected_trials
+                            .iter()
+                            .any(|trial| trial.wolfe_satisfied == Some(false))
+                    }),
                     current_qp.as_ref(),
-                    elastic_recovery_used,
+                    previous_elastic_recovery_used,
                     false,
                 ),
             };
@@ -3196,7 +3222,10 @@ where
             // directional derivative are both near machine precision. Allow a tiny absolute
             // slack so nearly-converged steps do not fail Armijo purely from rounding.
             let armijo_abs_tol = current_merit.abs().max(1.0) * 1e-12;
-            let armijo_satisfied = trial_eval.merit <= armijo_rhs + armijo_abs_tol;
+            let armijo_satisfied_strict = trial_eval.merit <= armijo_rhs;
+            let armijo_tolerance_adjusted =
+                !armijo_satisfied_strict && trial_eval.merit <= armijo_rhs + armijo_abs_tol;
+            let armijo_satisfied = armijo_satisfied_strict || armijo_tolerance_adjusted;
             let wolfe_satisfied = options.wolfe_c2.map(|c2| {
                 trial_directional_derivative
                     .expect("wolfe_c2 implies a trial directional derivative")
@@ -3212,6 +3241,7 @@ where
                     trial,
                     trial_eval,
                     armijo_satisfied,
+                    armijo_tolerance_adjusted,
                     wolfe_satisfied,
                     violation_satisfied,
                 ));
@@ -3228,6 +3258,7 @@ where
                 eq_inf: trial_eval.eq_inf,
                 ineq_inf: trial_eval.ineq_inf,
                 armijo_satisfied,
+                armijo_tolerance_adjusted,
                 wolfe_satisfied,
                 violation_satisfied,
             });
@@ -3235,7 +3266,14 @@ where
             alpha *= options.line_search_beta;
             line_search_iterations += 1;
         }
-        let Some((trial, accepted_eval, armijo_satisfied, wolfe_satisfied, violation_satisfied)) =
+        let Some((
+            trial,
+            accepted_eval,
+            armijo_satisfied,
+            armijo_tolerance_adjusted,
+            wolfe_satisfied,
+            violation_satisfied,
+        )) =
             accepted_trial
         else {
             return Err(ClarabelSqpError::LineSearchFailed {
@@ -3266,6 +3304,7 @@ where
             last_tried_alpha,
             backtrack_count: line_search_iterations,
             armijo_satisfied,
+            armijo_tolerance_adjusted,
             wolfe_satisfied,
             violation_satisfied,
             rejected_trials,
@@ -3295,6 +3334,7 @@ where
         previous_events = snapshot_events(
             penalty_updated,
             Some(line_search_iterations),
+            armijo_tolerance_adjusted,
             wolfe_rejected,
             previous_qp.as_ref(),
             previous_elastic_recovery_used,
@@ -3438,6 +3478,9 @@ where
             previous_line_search
                 .as_ref()
                 .map(|info| info.backtrack_count),
+            previous_line_search
+                .as_ref()
+                .is_some_and(|info| info.armijo_tolerance_adjusted),
             previous_line_search.as_ref().is_some_and(|info| {
                 info.rejected_trials
                     .iter()

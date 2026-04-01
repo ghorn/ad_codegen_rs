@@ -2,7 +2,8 @@ use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, NonFiniteCallbackStage,
     NonFiniteInputStage, ParameterMatrix, SqpFinalStateKind, SqpIterationEvent, SqpIterationPhase,
-    SqpTermination, SymbolicNlpOutputs, solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
+    SqpTermination, SymbolicNlpOutputs, TypedRuntimeNlpBounds, solve_nlp_sqp,
+    solve_nlp_sqp_with_callback, symbolic_nlp,
 };
 use rstest::rstest;
 use std::sync::OnceLock;
@@ -747,6 +748,45 @@ fn sqp_callback_exposes_post_convergence_snapshot() {
         SqpIterationPhase::PostConvergence
     );
     assert_eq!(summary.final_state.iteration, final_snapshot.iteration);
+}
+
+#[test]
+fn sqp_marks_armijo_tolerance_adjusted_acceptance() {
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>("telemetry_parameterized_quadratic", |x, p| {
+            SymbolicNlpOutputs {
+                objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
+                equalities: x.x + x.y,
+                inequalities: (),
+            }
+        })
+        .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let mut snapshots = Vec::new();
+    let options = ClarabelSqpOptions {
+        max_iters: 300,
+        dual_tol: 1e-9,
+        constraint_tol: 1e-9,
+        complementarity_tol: 1e-9,
+        verbose: false,
+        ..ClarabelSqpOptions::default()
+    };
+    let summary = compiled
+        .solve_sqp_with_callback(
+            &Pair { x: 0.9, y: 0.1 },
+            &Pair { x: 0.25, y: 0.75 },
+            &TypedRuntimeNlpBounds::default(),
+            &options,
+            |snapshot| snapshots.push(snapshot.clone()),
+        )
+        .expect("solve should succeed");
+
+    assert_eq!(summary.termination, SqpTermination::Converged);
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot
+            .events
+            .contains(&SqpIterationEvent::ArmijoToleranceAdjusted)
+    }));
 }
 
 #[test]
