@@ -20,7 +20,7 @@ use optimization::{
     TypedCompiledJitNlp, TypedRuntimeNlpBounds, Vectorize,
 };
 #[cfg(feature = "ipopt")]
-use optimization::{IpoptOptions, IpoptSolveError, IpoptSolveStatus, IpoptSummary};
+use optimization::{IpoptOptions, IpoptRawStatus, IpoptSolveError, IpoptSummary};
 use sx_core::SX;
 
 use crate::manifest::KnownStatus;
@@ -142,11 +142,10 @@ where
     <X as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <P as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
     <I as Vectorize<SX>>::Rebind<f64>: Vectorize<f64> + Clone + Send + Sync + 'static,
-    Build:
-        Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>
-            + Send
-            + Sync
-            + 'static,
+    Build: Fn(ProblemRunOptions) -> anyhow::Result<TypedProblemData<X, P, E, I>>
+        + Send
+        + Sync
+        + 'static,
     Validate: Fn(&ProblemRunRecord) -> ValidationOutcome + Send + Sync + 'static,
 {
     ProblemCase {
@@ -1113,12 +1112,11 @@ fn render_sqp_transcript(
             && let Some(qp_failure) = &context.qp_failure
         {
             out.push_str("\nqp_failure\n\n");
-            let _ = writeln!(out, "status: {:?}", qp_failure.qp_info.raw_status);
+            let _ = writeln!(out, "status: {}", qp_failure.qp_info.raw_status);
             let _ = writeln!(
                 out,
                 "dims: vars={} constraints={}",
-                qp_failure.variable_count,
-                qp_failure.constraint_count
+                qp_failure.variable_count, qp_failure.constraint_count
             );
             let _ = writeln!(
                 out,
@@ -1139,7 +1137,11 @@ fn render_sqp_transcript(
                 .map(|cone| format!("{}:{}", cone.kind, cone.dim))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = writeln!(out, "cones: {}", if cones.is_empty() { "--" } else { &cones });
+            let _ = writeln!(
+                out,
+                "cones: {}",
+                if cones.is_empty() { "--" } else { &cones }
+            );
             if let Some(transcript) = &qp_failure.transcript {
                 let _ = writeln!(out, "\nclarabel_qp_transcript\n");
                 out.push_str(transcript);
@@ -1292,7 +1294,7 @@ fn render_ipopt_transcript(
         );
     }
     if let Some(summary) = summary {
-        let _ = writeln!(out, "status: {:?}", summary.status);
+        let _ = writeln!(out, "status: {}", summary.status);
         let _ = writeln!(out, "iterations: {}", summary.iterations);
         let _ = writeln!(out, "\ntermination: converged");
     }
@@ -1303,7 +1305,7 @@ fn render_ipopt_transcript(
             IpoptSolveError::Solve {
                 status, iterations, ..
             } => {
-                let _ = writeln!(out, "status: {status:?}");
+                let _ = writeln!(out, "status: {status}");
                 let _ = writeln!(out, "iterations: {iterations}");
             }
             IpoptSolveError::InvalidInput(message) | IpoptSolveError::Setup(message) => {
@@ -1347,26 +1349,26 @@ fn ipopt_error_code(error: &IpoptSolveError) -> &'static str {
         IpoptSolveError::Setup(_) => "setup",
         IpoptSolveError::OptionRejected { .. } => "option_rejected",
         IpoptSolveError::Solve { status, .. } => match status {
-            IpoptSolveStatus::SolveSucceeded
-            | IpoptSolveStatus::SolvedToAcceptableLevel
-            | IpoptSolveStatus::FeasiblePointFound => "unexpected_success",
-            IpoptSolveStatus::InfeasibleProblemDetected => "infeasible_problem",
-            IpoptSolveStatus::SearchDirectionBecomesTooSmall => "search_direction_small",
-            IpoptSolveStatus::DivergingIterates => "diverging_iterates",
-            IpoptSolveStatus::UserRequestedStop => "user_stop",
-            IpoptSolveStatus::MaximumIterationsExceeded => "max_iters",
-            IpoptSolveStatus::MaximumCpuTimeExceeded => "max_cpu_time",
-            IpoptSolveStatus::RestorationFailed => "restoration_failed",
-            IpoptSolveStatus::ErrorInStepComputation => "step_computation",
-            IpoptSolveStatus::NotEnoughDegreesOfFreedom => "not_enough_dof",
-            IpoptSolveStatus::InvalidProblemDefinition => "invalid_problem",
-            IpoptSolveStatus::InvalidOption => "invalid_option",
-            IpoptSolveStatus::InvalidNumberDetected => "invalid_number",
-            IpoptSolveStatus::UnrecoverableException => "unrecoverable_exception",
-            IpoptSolveStatus::NonIpoptExceptionThrown => "non_ipopt_exception",
-            IpoptSolveStatus::InsufficientMemory => "insufficient_memory",
-            IpoptSolveStatus::InternalError => "internal_error",
-            IpoptSolveStatus::UnknownError => "unknown_error",
+            IpoptRawStatus::SolveSucceeded
+            | IpoptRawStatus::SolvedToAcceptableLevel
+            | IpoptRawStatus::FeasiblePointFound => "unexpected_success",
+            IpoptRawStatus::InfeasibleProblemDetected => "infeasible_problem",
+            IpoptRawStatus::SearchDirectionBecomesTooSmall => "search_direction_small",
+            IpoptRawStatus::DivergingIterates => "diverging_iterates",
+            IpoptRawStatus::UserRequestedStop => "user_stop",
+            IpoptRawStatus::MaximumIterationsExceeded => "max_iters",
+            IpoptRawStatus::MaximumCpuTimeExceeded => "max_cpu_time",
+            IpoptRawStatus::RestorationFailed => "restoration_failed",
+            IpoptRawStatus::ErrorInStepComputation => "step_computation",
+            IpoptRawStatus::NotEnoughDegreesOfFreedom => "not_enough_dof",
+            IpoptRawStatus::InvalidProblemDefinition => "invalid_problem",
+            IpoptRawStatus::InvalidOption => "invalid_option",
+            IpoptRawStatus::InvalidNumberDetected => "invalid_number",
+            IpoptRawStatus::UnrecoverableException => "unrecoverable_exception",
+            IpoptRawStatus::NonIpoptExceptionThrown => "non_ipopt_exception",
+            IpoptRawStatus::InsufficientMemory => "insufficient_memory",
+            IpoptRawStatus::InternalError => "internal_error",
+            IpoptRawStatus::UnknownError => "unknown_error",
         },
     }
 }

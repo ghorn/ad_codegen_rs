@@ -10,12 +10,15 @@ use thiserror::Error;
 use crate::{
     BackendTimingMetadata, CCS, ClarabelSqpError, ClarabelSqpOptions, ClarabelSqpSummary,
     CompiledNlpProblem, Index, InteriorPointIterationSnapshot, InteriorPointOptions,
-    InteriorPointSolveError, InteriorPointSummary, ParameterMatrix, Vectorize, flatten_value,
-    solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_sqp,
+    InteriorPointSolveError, InteriorPointSummary, ParameterMatrix, SqpAdapterTiming, Vectorize,
+    flatten_value, solve_nlp_interior_point, solve_nlp_interior_point_with_callback, solve_nlp_sqp,
     solve_nlp_sqp_with_callback, symbolic_column, symbolic_value,
 };
 #[cfg(feature = "ipopt")]
-use crate::{IpoptOptions, IpoptSolveError, IpoptSummary, solve_nlp_ipopt};
+use crate::{
+    IpoptIterationSnapshot, IpoptOptions, IpoptSolveError, IpoptSummary, solve_nlp_ipopt,
+    solve_nlp_ipopt_with_callback,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 struct SymbolicNlp {
@@ -109,12 +112,19 @@ pub struct RuntimeBoundedJitNlp<'a> {
     base: &'a CompiledJitNlp,
     variable_bounds: ConstraintBounds,
     inequality_mapping: InequalityMapping,
+    adapter_timing: Mutex<SqpAdapterTiming>,
 }
 
 #[derive(Debug)]
 struct JitKernel {
     function: CompiledJitFunction,
     context: Mutex<JitExecutionContext>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct KernelEvalTiming {
+    evaluation: Duration,
+    output_marshalling: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -357,10 +367,13 @@ impl CompiledJitNlp {
                 || CCS::empty(0, symbolic.variables.nnz()),
                 function_output_ccs,
             ),
-            inequality_base_jacobian_ccs: functions.inequality_jacobian_values.as_ref().map_or_else(
-                || CCS::empty(0, symbolic.variables.nnz()),
-                function_output_ccs,
-            ),
+            inequality_base_jacobian_ccs: functions
+                .inequality_jacobian_values
+                .as_ref()
+                .map_or_else(
+                    || CCS::empty(0, symbolic.variables.nnz()),
+                    function_output_ccs,
+                ),
             lagrangian_hessian_ccs: function_output_ccs(&functions.lagrangian_hessian_values),
             backend_timing: BackendTimingMetadata {
                 function_creation_time: symbolic.construction_time,
@@ -413,79 +426,141 @@ impl CompiledJitNlp {
         &self.lagrangian_hessian_ccs
     }
 
-    pub fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
-        self.objective_value.eval_scalar(x, parameters)
+    fn objective_value_timed(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+    ) -> (f64, SqpAdapterTiming) {
+        let (value, timing) = self.objective_value.eval_scalar_timed(x, parameters);
+        (
+            value,
+            SqpAdapterTiming {
+                callback_evaluation: timing.evaluation,
+                output_marshalling: timing.output_marshalling,
+                layout_projection: Duration::ZERO,
+            },
+        )
     }
 
-    pub fn objective_gradient(
+    fn objective_gradient_timed(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
-    ) {
-        self.objective_gradient.eval_vector(x, parameters, out);
-    }
-
-    pub fn equality_values(
-        &self,
-        x: &[f64],
-        parameters: &[ParameterMatrix<'_>],
-        out: &mut [f64],
-    ) {
-        if let Some(kernel) = &self.equality_values {
-            kernel.eval_vector(x, parameters, out);
+    ) -> SqpAdapterTiming {
+        let timing = self
+            .objective_gradient
+            .eval_vector_timed(x, parameters, out);
+        SqpAdapterTiming {
+            callback_evaluation: timing.evaluation,
+            output_marshalling: timing.output_marshalling,
+            layout_projection: Duration::ZERO,
         }
     }
 
-    pub fn equality_jacobian_values(
+    fn equality_values_timed(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
-    ) {
-        if let Some(kernel) = &self.equality_jacobian_values {
-            kernel.eval_vector(x, parameters, out);
+    ) -> SqpAdapterTiming {
+        let timing = self
+            .equality_values
+            .as_ref()
+            .map_or_else(KernelEvalTiming::default, |kernel| {
+                kernel.eval_vector_timed(x, parameters, out)
+            });
+        SqpAdapterTiming {
+            callback_evaluation: timing.evaluation,
+            output_marshalling: timing.output_marshalling,
+            layout_projection: Duration::ZERO,
         }
     }
 
-    pub fn inequality_values(
+    fn equality_jacobian_values_timed(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
-    ) {
-        if let Some(kernel) = &self.inequality_values {
-            kernel.eval_vector(x, parameters, out);
+    ) -> SqpAdapterTiming {
+        let timing = self
+            .equality_jacobian_values
+            .as_ref()
+            .map_or_else(KernelEvalTiming::default, |kernel| {
+                kernel.eval_vector_timed(x, parameters, out)
+            });
+        SqpAdapterTiming {
+            callback_evaluation: timing.evaluation,
+            output_marshalling: timing.output_marshalling,
+            layout_projection: Duration::ZERO,
         }
     }
 
-    pub fn inequality_jacobian_values(
+    fn inequality_values_timed(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
-    ) {
-        if let Some(kernel) = &self.inequality_jacobian_values {
-            kernel.eval_vector(x, parameters, out);
+    ) -> SqpAdapterTiming {
+        let timing = self
+            .inequality_values
+            .as_ref()
+            .map_or_else(KernelEvalTiming::default, |kernel| {
+                kernel.eval_vector_timed(x, parameters, out)
+            });
+        SqpAdapterTiming {
+            callback_evaluation: timing.evaluation,
+            output_marshalling: timing.output_marshalling,
+            layout_projection: Duration::ZERO,
         }
     }
 
-    pub fn lagrangian_hessian_values(
+    fn inequality_jacobian_values_timed(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) -> SqpAdapterTiming {
+        let timing = self
+            .inequality_jacobian_values
+            .as_ref()
+            .map_or_else(KernelEvalTiming::default, |kernel| {
+                kernel.eval_vector_timed(x, parameters, out)
+            });
+        SqpAdapterTiming {
+            callback_evaluation: timing.evaluation,
+            output_marshalling: timing.output_marshalling,
+            layout_projection: Duration::ZERO,
+        }
+    }
+
+    fn lagrangian_hessian_values_timed(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
         out: &mut [f64],
-    ) {
-        self.lagrangian_hessian_values
-            .eval_hessian(x, parameters, equality_multipliers, inequality_multipliers, out);
+    ) -> SqpAdapterTiming {
+        let timing = self.lagrangian_hessian_values.eval_hessian_timed(
+            x,
+            parameters,
+            equality_multipliers,
+            inequality_multipliers,
+            out,
+        );
+        SqpAdapterTiming {
+            callback_evaluation: timing.evaluation,
+            output_marshalling: timing.output_marshalling,
+            layout_projection: Duration::ZERO,
+        }
     }
 
     pub fn bind_runtime_bounds(
         &self,
         bounds: RuntimeNlpBounds,
     ) -> Result<RuntimeBoundedJitNlp<'_>, RuntimeNlpBoundsError> {
+        let projection_started = Instant::now();
         let variable_bounds = validate_bound_vectors(self.dimension, bounds.variables, true)?;
         let inequality_bounds =
             validate_bound_vectors(self.inequality_base_count(), bounds.inequalities, false)?;
@@ -497,6 +572,10 @@ impl CompiledJitNlp {
             base: self,
             variable_bounds,
             inequality_mapping: mapping,
+            adapter_timing: Mutex::new(SqpAdapterTiming {
+                layout_projection: projection_started.elapsed(),
+                ..SqpAdapterTiming::default()
+            }),
         })
     }
 }
@@ -538,11 +617,13 @@ where
         bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &ClarabelSqpOptions,
     ) -> Result<ClarabelSqpSummary, ClarabelSqpError> {
+        let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
         let x0_values = flatten_value(x0);
         let parameter_values = flatten_value(parameters);
+        bound_problem.record_layout_projection(projection_started.elapsed());
         let parameter_storage = if P::LEN == 0 {
             Vec::new()
         } else {
@@ -565,11 +646,13 @@ where
     where
         CB: FnMut(&crate::SqpIterationSnapshot),
     {
+        let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
             .map_err(|err| ClarabelSqpError::InvalidInput(err.to_string()))?;
         let x0_values = flatten_value(x0);
         let parameter_values = flatten_value(parameters);
+        bound_problem.record_layout_projection(projection_started.elapsed());
         let parameter_storage = if P::LEN == 0 {
             Vec::new()
         } else {
@@ -594,11 +677,13 @@ where
         bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &InteriorPointOptions,
     ) -> Result<InteriorPointSummary, InteriorPointSolveError> {
+        let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         let x0_values = flatten_value(x0);
         let parameter_values = flatten_value(parameters);
+        bound_problem.record_layout_projection(projection_started.elapsed());
         let parameter_storage = if P::LEN == 0 {
             Vec::new()
         } else {
@@ -621,11 +706,13 @@ where
     where
         CB: FnMut(&InteriorPointIterationSnapshot),
     {
+        let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
             .map_err(|err| InteriorPointSolveError::InvalidInput(err.to_string()))?;
         let x0_values = flatten_value(x0);
         let parameter_values = flatten_value(parameters);
+        bound_problem.record_layout_projection(projection_started.elapsed());
         let parameter_storage = if P::LEN == 0 {
             Vec::new()
         } else {
@@ -651,11 +738,13 @@ where
         bounds: &TypedRuntimeNlpBounds<X, I>,
         options: &IpoptOptions,
     ) -> Result<IpoptSummary, IpoptSolveError> {
+        let projection_started = Instant::now();
         let bound_problem = self
             .bind_runtime_bounds(bounds)
             .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
         let x0_values = flatten_value(x0);
         let parameter_values = flatten_value(parameters);
+        bound_problem.record_layout_projection(projection_started.elapsed());
         let parameter_storage = if P::LEN == 0 {
             Vec::new()
         } else {
@@ -666,6 +755,42 @@ where
         };
         solve_nlp_ipopt(&bound_problem, &x0_values, &parameter_storage, options)
     }
+
+    #[cfg(feature = "ipopt")]
+    pub fn solve_ipopt_with_callback<CB>(
+        &self,
+        x0: &<X as Vectorize<SX>>::Rebind<f64>,
+        parameters: &<P as Vectorize<SX>>::Rebind<f64>,
+        bounds: &TypedRuntimeNlpBounds<X, I>,
+        options: &IpoptOptions,
+        callback: CB,
+    ) -> Result<IpoptSummary, IpoptSolveError>
+    where
+        CB: FnMut(&IpoptIterationSnapshot),
+    {
+        let projection_started = Instant::now();
+        let bound_problem = self
+            .bind_runtime_bounds(bounds)
+            .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
+        let x0_values = flatten_value(x0);
+        let parameter_values = flatten_value(parameters);
+        bound_problem.record_layout_projection(projection_started.elapsed());
+        let parameter_storage = if P::LEN == 0 {
+            Vec::new()
+        } else {
+            vec![ParameterMatrix {
+                ccs: self.inner.parameter_ccs(0),
+                values: &parameter_values,
+            }]
+        };
+        solve_nlp_ipopt_with_callback(
+            &bound_problem,
+            &x0_values,
+            &parameter_storage,
+            options,
+            callback,
+        )
+    }
 }
 
 fn compile_symbolic_nlp(
@@ -673,6 +798,20 @@ fn compile_symbolic_nlp(
     opt_level: LlvmOptimizationLevel,
 ) -> Result<CompiledJitNlp, SymbolicNlpCompileError> {
     CompiledJitNlp::from_symbolic(symbolic, opt_level)
+}
+
+impl RuntimeBoundedJitNlp<'_> {
+    fn record_adapter_timing(&self, timing: SqpAdapterTiming) {
+        let mut totals = lock_context(&self.adapter_timing);
+        totals.callback_evaluation += timing.callback_evaluation;
+        totals.output_marshalling += timing.output_marshalling;
+        totals.layout_projection += timing.layout_projection;
+    }
+
+    fn record_layout_projection(&self, elapsed: Duration) {
+        let mut totals = lock_context(&self.adapter_timing);
+        totals.layout_projection += elapsed;
+    }
 }
 
 impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
@@ -689,6 +828,7 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     }
 
     fn variable_bounds(&self, lower: &mut [f64], upper: &mut [f64]) -> bool {
+        let started = Instant::now();
         lower.fill(-crate::NLP_INF);
         upper.fill(crate::NLP_INF);
         if let Some(bounds) = &self.variable_bounds.lower {
@@ -697,11 +837,16 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         if let Some(bounds) = &self.variable_bounds.upper {
             upper.copy_from_slice(bounds);
         }
+        self.record_layout_projection(started.elapsed());
         true
     }
 
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         self.base.backend_timing_metadata()
+    }
+
+    fn sqp_adapter_timing_snapshot(&self) -> Option<SqpAdapterTiming> {
+        Some(*lock_context(&self.adapter_timing))
     }
 
     fn equality_count(&self) -> Index {
@@ -713,11 +858,14 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     }
 
     fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
-        self.base.objective_value(x, parameters)
+        let (value, timing) = self.base.objective_value_timed(x, parameters);
+        self.record_adapter_timing(timing);
+        value
     }
 
     fn objective_gradient(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
-        self.base.objective_gradient(x, parameters, out);
+        let timing = self.base.objective_gradient_timed(x, parameters, out);
+        self.record_adapter_timing(timing);
     }
 
     fn equality_jacobian_ccs(&self) -> &CCS {
@@ -725,7 +873,8 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     }
 
     fn equality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
-        self.base.equality_values(x, parameters, out);
+        let timing = self.base.equality_values_timed(x, parameters, out);
+        self.record_adapter_timing(timing);
     }
 
     fn equality_jacobian_values(
@@ -734,7 +883,8 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
     ) {
-        self.base.equality_jacobian_values(x, parameters, out);
+        let timing = self.base.equality_jacobian_values_timed(x, parameters, out);
+        self.record_adapter_timing(timing);
     }
 
     fn inequality_jacobian_ccs(&self) -> &CCS {
@@ -742,12 +892,19 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
     }
 
     fn inequality_values(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+        let layout_started = Instant::now();
         let mut inequality_values = vec![0.0; self.base.inequality_base_count()];
-        self.base
-            .inequality_values(x, parameters, &mut inequality_values);
+        let base_timing = self
+            .base
+            .inequality_values_timed(x, parameters, &mut inequality_values);
         for (slot, transform) in out.iter_mut().zip(self.inequality_mapping.rows.iter()) {
             *slot = transform.sign * inequality_values[transform.source_index] + transform.offset;
         }
+        self.record_adapter_timing(SqpAdapterTiming {
+            callback_evaluation: base_timing.callback_evaluation,
+            output_marshalling: base_timing.output_marshalling,
+            layout_projection: layout_started.elapsed(),
+        });
     }
 
     fn inequality_jacobian_values(
@@ -756,12 +913,22 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         parameters: &[ParameterMatrix<'_>],
         out: &mut [f64],
     ) {
+        let layout_started = Instant::now();
         let mut source_values = vec![0.0; self.base.inequality_base_jacobian_ccs().nnz()];
-        self.base
-            .inequality_jacobian_values(x, parameters, &mut source_values);
-        for (slot, mapping) in out.iter_mut().zip(self.inequality_mapping.inequality_value_map.iter()) {
+        let base_timing =
+            self.base
+                .inequality_jacobian_values_timed(x, parameters, &mut source_values);
+        for (slot, mapping) in out
+            .iter_mut()
+            .zip(self.inequality_mapping.inequality_value_map.iter())
+        {
             *slot = mapping.sign * source_values[mapping.source_value_index];
         }
+        self.record_adapter_timing(SqpAdapterTiming {
+            callback_evaluation: base_timing.callback_evaluation,
+            output_marshalling: base_timing.output_marshalling,
+            layout_projection: layout_started.elapsed(),
+        });
     }
 
     fn lagrangian_hessian_ccs(&self) -> &CCS {
@@ -776,6 +943,7 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         inequality_multipliers: &[f64],
         out: &mut [f64],
     ) {
+        let layout_started = Instant::now();
         let mut base_inequality_multipliers = vec![0.0; self.base.inequality_base_count()];
         for (multiplier, transform) in inequality_multipliers
             .iter()
@@ -783,8 +951,18 @@ impl CompiledNlpProblem for RuntimeBoundedJitNlp<'_> {
         {
             base_inequality_multipliers[transform.source_index] += transform.sign * multiplier;
         }
-        self.base
-            .lagrangian_hessian_values(x, parameters, equality_multipliers, &base_inequality_multipliers, out);
+        let base_timing = self.base.lagrangian_hessian_values_timed(
+            x,
+            parameters,
+            equality_multipliers,
+            &base_inequality_multipliers,
+            out,
+        );
+        self.record_adapter_timing(SqpAdapterTiming {
+            callback_evaluation: base_timing.callback_evaluation,
+            output_marshalling: base_timing.output_marshalling,
+            layout_projection: layout_started.elapsed(),
+        });
     }
 }
 
@@ -796,10 +974,8 @@ impl InequalityMapping {
         let mut inequality_rows = Vec::new();
         let mut inequality_by_source = vec![Vec::<(Index, f64)>::new(); count];
 
-        for (source_index, rows_for_source) in inequality_by_source
-            .iter_mut()
-            .enumerate()
-            .take(count)
+        for (source_index, rows_for_source) in
+            inequality_by_source.iter_mut().enumerate().take(count)
         {
             let lower_bound = lower.get(source_index).copied().unwrap_or(-crate::NLP_INF);
             let upper_bound = upper.get(source_index).copied().unwrap_or(crate::NLP_INF);
@@ -846,28 +1022,56 @@ impl JitKernel {
         })
     }
 
-    fn eval_scalar(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64 {
+    fn eval_scalar_timed(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+    ) -> (f64, KernelEvalTiming) {
         let mut context = lock_context(&self.context);
         load_jit_inputs(&self.function, &mut context, x, parameters, &[], &[]);
+        let eval_started = Instant::now();
         self.function.eval(&mut context);
-        context.output(0)[0]
+        let evaluation = eval_started.elapsed();
+        let marshal_started = Instant::now();
+        let value = context.output(0)[0];
+        let output_marshalling = marshal_started.elapsed();
+        (
+            value,
+            KernelEvalTiming {
+                evaluation,
+                output_marshalling,
+            },
+        )
     }
 
-    fn eval_vector(&self, x: &[f64], parameters: &[ParameterMatrix<'_>], out: &mut [f64]) {
+    fn eval_vector_timed(
+        &self,
+        x: &[f64],
+        parameters: &[ParameterMatrix<'_>],
+        out: &mut [f64],
+    ) -> KernelEvalTiming {
         let mut context = lock_context(&self.context);
         load_jit_inputs(&self.function, &mut context, x, parameters, &[], &[]);
+        let eval_started = Instant::now();
         self.function.eval(&mut context);
+        let evaluation = eval_started.elapsed();
+        let marshal_started = Instant::now();
         out.copy_from_slice(context.output(0));
+        let output_marshalling = marshal_started.elapsed();
+        KernelEvalTiming {
+            evaluation,
+            output_marshalling,
+        }
     }
 
-    fn eval_hessian(
+    fn eval_hessian_timed(
         &self,
         x: &[f64],
         parameters: &[ParameterMatrix<'_>],
         equality_multipliers: &[f64],
         inequality_multipliers: &[f64],
         out: &mut [f64],
-    ) {
+    ) -> KernelEvalTiming {
         let mut context = lock_context(&self.context);
         load_jit_inputs(
             &self.function,
@@ -877,8 +1081,16 @@ impl JitKernel {
             equality_multipliers,
             inequality_multipliers,
         );
+        let eval_started = Instant::now();
         self.function.eval(&mut context);
+        let evaluation = eval_started.elapsed();
+        let marshal_started = Instant::now();
         out.copy_from_slice(context.output(0));
+        let output_marshalling = marshal_started.elapsed();
+        KernelEvalTiming {
+            evaluation,
+            output_marshalling,
+        }
     }
 }
 
@@ -992,8 +1204,10 @@ fn derive_symbolic_functions(
     }
     let inequality_count = symbolic.inequalities.as_ref().map_or(0, SXMatrix::nnz);
     if let Some(inequalities) = &symbolic.inequalities {
-        let lambda =
-            SXMatrix::sym("lambda_inequalities", CoreCcs::column_vector(inequality_count)?)?;
+        let lambda = SXMatrix::sym(
+            "lambda_inequalities",
+            CoreCcs::column_vector(inequality_count)?,
+        )?;
         for idx in 0..inequalities.nnz() {
             lagrangian += lambda.nz(idx) * inequalities.nz(idx);
         }

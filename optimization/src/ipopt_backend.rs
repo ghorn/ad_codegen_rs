@@ -1,21 +1,25 @@
 use crate::{
-    CCS, CompiledNlpProblem, Index, ParameterMatrix, complementarity_inf_norm, inf_norm,
-    lagrangian_gradient, positive_part_inf_norm, validate_nlp_problem_shapes,
-    validate_parameter_inputs,
+    BackendTimingMetadata, CCS, CompiledNlpProblem, EvalTimingStat, Index, ParameterMatrix,
+    SolverAdapterTiming, complementarity_inf_norm, inf_norm, lagrangian_gradient,
+    positive_part_inf_norm, validate_nlp_problem_shapes, validate_parameter_inputs,
 };
 use anyhow::{Result, bail};
 use ipopt::{
     AlgorithmMode, BasicProblem, ConstrainedProblem, Index as IpoptIndex, IntermediateCallbackData,
     Ipopt, NewtonProblem, Number, SolveStatus,
 };
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const IPOPT_INF: f64 = 1e20;
 const IPOPT_JOURNAL_PRINT_LEVEL: i32 = 5;
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpoptMuStrategy {
     Adaptive,
@@ -31,6 +35,7 @@ impl IpoptMuStrategy {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct IpoptOptions {
     pub max_iters: Index,
@@ -60,6 +65,7 @@ impl Default for IpoptOptions {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpoptIterationPhase {
     Regular,
@@ -75,6 +81,83 @@ impl From<AlgorithmMode> for IpoptIterationPhase {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpoptRawStatus {
+    SolveSucceeded,
+    SolvedToAcceptableLevel,
+    FeasiblePointFound,
+    InfeasibleProblemDetected,
+    SearchDirectionBecomesTooSmall,
+    DivergingIterates,
+    UserRequestedStop,
+    MaximumIterationsExceeded,
+    MaximumCpuTimeExceeded,
+    RestorationFailed,
+    ErrorInStepComputation,
+    InvalidOption,
+    NotEnoughDegreesOfFreedom,
+    InvalidProblemDefinition,
+    InvalidNumberDetected,
+    UnrecoverableException,
+    NonIpoptExceptionThrown,
+    InsufficientMemory,
+    InternalError,
+    UnknownError,
+}
+
+impl From<SolveStatus> for IpoptRawStatus {
+    fn from(status: SolveStatus) -> Self {
+        match status {
+            SolveStatus::SolveSucceeded => Self::SolveSucceeded,
+            SolveStatus::SolvedToAcceptableLevel => Self::SolvedToAcceptableLevel,
+            SolveStatus::FeasiblePointFound => Self::FeasiblePointFound,
+            SolveStatus::InfeasibleProblemDetected => Self::InfeasibleProblemDetected,
+            SolveStatus::SearchDirectionBecomesTooSmall => Self::SearchDirectionBecomesTooSmall,
+            SolveStatus::DivergingIterates => Self::DivergingIterates,
+            SolveStatus::UserRequestedStop => Self::UserRequestedStop,
+            SolveStatus::MaximumIterationsExceeded => Self::MaximumIterationsExceeded,
+            SolveStatus::MaximumCpuTimeExceeded => Self::MaximumCpuTimeExceeded,
+            SolveStatus::RestorationFailed => Self::RestorationFailed,
+            SolveStatus::ErrorInStepComputation => Self::ErrorInStepComputation,
+            SolveStatus::InvalidOption => Self::InvalidOption,
+            SolveStatus::NotEnoughDegreesOfFreedom => Self::NotEnoughDegreesOfFreedom,
+            SolveStatus::InvalidProblemDefinition => Self::InvalidProblemDefinition,
+            SolveStatus::InvalidNumberDetected => Self::InvalidNumberDetected,
+            SolveStatus::UnrecoverableException => Self::UnrecoverableException,
+            SolveStatus::NonIpoptExceptionThrown => Self::NonIpoptExceptionThrown,
+            SolveStatus::InsufficientMemory => Self::InsufficientMemory,
+            SolveStatus::InternalError => Self::InternalError,
+            SolveStatus::UnknownError => Self::UnknownError,
+        }
+    }
+}
+
+impl std::fmt::Display for IpoptRawStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpoptIterationTiming {
+    pub adapter_timing: Option<SolverAdapterTiming>,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub objective_value: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub objective_gradient: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub constraint_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub constraint_jacobian_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub hessian_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub total_callback: Duration,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct IpoptIterationSnapshot {
     pub iteration: Index,
@@ -88,8 +171,24 @@ pub struct IpoptIterationSnapshot {
     pub alpha_pr: f64,
     pub alpha_du: f64,
     pub line_search_trials: Index,
+    pub timing: IpoptIterationTiming,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpoptProfiling {
+    pub objective_value: EvalTimingStat,
+    pub objective_gradient: EvalTimingStat,
+    pub constraint_values: EvalTimingStat,
+    pub constraint_jacobian_values: EvalTimingStat,
+    pub hessian_values: EvalTimingStat,
+    pub adapter_timing: Option<SolverAdapterTiming>,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub total_time: Duration,
+    pub backend_timing: BackendTimingMetadata,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct IpoptSummary {
     pub x: Vec<f64>,
@@ -99,7 +198,7 @@ pub struct IpoptSummary {
     pub inequality_multipliers: Vec<f64>,
     pub objective: f64,
     pub iterations: Index,
-    pub status: SolveStatus,
+    pub status: IpoptRawStatus,
     pub equality_inf_norm: f64,
     pub inequality_inf_norm: f64,
     pub primal_inf_norm: f64,
@@ -107,8 +206,10 @@ pub struct IpoptSummary {
     pub complementarity_inf_norm: f64,
     pub snapshots: Vec<IpoptIterationSnapshot>,
     pub journal_output: Option<String>,
+    pub profiling: IpoptProfiling,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Error)]
 pub enum IpoptSolveError {
     #[error("invalid IPOPT input: {0}")]
@@ -119,11 +220,94 @@ pub enum IpoptSolveError {
     OptionRejected { name: String },
     #[error("ipopt failed with status {status:?}")]
     Solve {
-        status: SolveStatus,
+        status: IpoptRawStatus,
         iterations: Index,
         snapshots: Vec<IpoptIterationSnapshot>,
         journal_output: Option<String>,
+        profiling: Box<IpoptProfiling>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IpoptTimingCheckpoint {
+    objective_value: Duration,
+    objective_gradient: Duration,
+    constraint_values: Duration,
+    constraint_jacobian_values: Duration,
+    hessian_values: Duration,
+    adapter_timing: Option<SolverAdapterTiming>,
+}
+
+impl IpoptTimingCheckpoint {
+    fn from_profiling(profiling: &IpoptProfiling) -> Self {
+        Self {
+            objective_value: profiling.objective_value.total_time,
+            objective_gradient: profiling.objective_gradient.total_time,
+            constraint_values: profiling.constraint_values.total_time,
+            constraint_jacobian_values: profiling.constraint_jacobian_values.total_time,
+            hessian_values: profiling.hessian_values.total_time,
+            adapter_timing: profiling.adapter_timing,
+        }
+    }
+
+    fn delta_since(self, baseline: Self) -> IpoptIterationTiming {
+        let adapter_timing = match (self.adapter_timing, baseline.adapter_timing) {
+            (Some(current), Some(previous)) => Some(current.saturating_sub(previous)),
+            (Some(current), None) => Some(current),
+            (None, _) => None,
+        };
+        let objective_value = self
+            .objective_value
+            .saturating_sub(baseline.objective_value);
+        let objective_gradient = self
+            .objective_gradient
+            .saturating_sub(baseline.objective_gradient);
+        let constraint_values = self
+            .constraint_values
+            .saturating_sub(baseline.constraint_values);
+        let constraint_jacobian_values = self
+            .constraint_jacobian_values
+            .saturating_sub(baseline.constraint_jacobian_values);
+        let hessian_values = self.hessian_values.saturating_sub(baseline.hessian_values);
+        IpoptIterationTiming {
+            adapter_timing,
+            objective_value,
+            objective_gradient,
+            constraint_values,
+            constraint_jacobian_values,
+            hessian_values,
+            total_callback: objective_value
+                + objective_gradient
+                + constraint_values
+                + constraint_jacobian_values
+                + hessian_values,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IpoptRuntimeState {
+    profiling: IpoptProfiling,
+    last_checkpoint: IpoptTimingCheckpoint,
+}
+
+trait IpoptIterationConsumer {
+    fn accept(&mut self, snapshot: &IpoptIterationSnapshot);
+}
+
+struct NoopIpoptIterationConsumer;
+
+impl IpoptIterationConsumer for NoopIpoptIterationConsumer {
+    fn accept(&mut self, _snapshot: &IpoptIterationSnapshot) {}
+}
+
+impl<F> IpoptIterationConsumer for F
+where
+    F: FnMut(&IpoptIterationSnapshot),
+{
+    fn accept(&mut self, snapshot: &IpoptIterationSnapshot) {
+        self(snapshot);
+    }
 }
 
 fn ccs_triplet_indices(
@@ -174,7 +358,7 @@ where
     Ok(())
 }
 
-struct IpoptProblemAdapter<'a, P> {
+struct IpoptProblemAdapter<'a, P, C = NoopIpoptIterationConsumer> {
     problem: &'a P,
     x0: &'a [f64],
     parameters: &'a [ParameterMatrix<'a>],
@@ -184,16 +368,20 @@ struct IpoptProblemAdapter<'a, P> {
     hessian_cols: Vec<IpoptIndex>,
     iterations: Index,
     snapshots: Vec<IpoptIterationSnapshot>,
+    runtime: RefCell<IpoptRuntimeState>,
+    callback: C,
 }
 
-impl<'a, P> IpoptProblemAdapter<'a, P>
+impl<'a, P, C> IpoptProblemAdapter<'a, P, C>
 where
     P: CompiledNlpProblem,
+    C: IpoptIterationConsumer,
 {
     fn new(
         problem: &'a P,
         x0: &'a [f64],
         parameters: &'a [ParameterMatrix<'a>],
+        callback: C,
     ) -> std::result::Result<Self, IpoptSolveError> {
         let (mut constraint_rows, mut constraint_cols) =
             ccs_triplet_indices(problem.equality_jacobian_ccs(), 0)?;
@@ -213,12 +401,29 @@ where
             hessian_cols,
             iterations: 0,
             snapshots: Vec::new(),
+            runtime: RefCell::new(IpoptRuntimeState {
+                profiling: IpoptProfiling {
+                    backend_timing: problem.backend_timing_metadata(),
+                    adapter_timing: problem.adapter_timing_snapshot(),
+                    ..IpoptProfiling::default()
+                },
+                last_checkpoint: IpoptTimingCheckpoint::default(),
+            }),
+            callback,
         })
     }
 
     fn record_iteration(&mut self, data: IntermediateCallbackData) -> bool {
         self.iterations = data.iter_count as usize;
-        self.snapshots.push(IpoptIterationSnapshot {
+        let timing = {
+            let mut runtime = self.runtime.borrow_mut();
+            runtime.profiling.adapter_timing = self.problem.adapter_timing_snapshot();
+            let checkpoint = IpoptTimingCheckpoint::from_profiling(&runtime.profiling);
+            let timing = checkpoint.delta_since(runtime.last_checkpoint);
+            runtime.last_checkpoint = checkpoint;
+            timing
+        };
+        let snapshot = IpoptIterationSnapshot {
             iteration: data.iter_count as usize,
             phase: data.alg_mod.into(),
             objective: data.obj_value,
@@ -230,13 +435,17 @@ where
             alpha_pr: data.alpha_pr,
             alpha_du: data.alpha_du,
             line_search_trials: data.ls_trials as usize,
-        });
+            timing,
+        };
+        self.callback.accept(&snapshot);
+        self.snapshots.push(snapshot);
         true
     }
 
     fn objective_hessian_values(&self, x: &[Number], vals: &mut [Number]) -> bool {
-        let mut equality_multipliers = vec![0.0; self.problem.equality_count()];
-        let mut inequality_multipliers = vec![0.0; self.problem.inequality_count()];
+        let equality_multipliers = vec![0.0; self.problem.equality_count()];
+        let inequality_multipliers = vec![0.0; self.problem.inequality_count()];
+        let started = Instant::now();
         self.problem.lagrangian_hessian_values(
             x,
             self.parameters,
@@ -244,15 +453,25 @@ where
             &inequality_multipliers,
             vals,
         );
-        equality_multipliers.clear();
-        inequality_multipliers.clear();
+        self.runtime
+            .borrow_mut()
+            .profiling
+            .hessian_values
+            .record(started.elapsed());
         true
+    }
+
+    fn profiling(&self) -> IpoptProfiling {
+        let mut profiling = self.runtime.borrow().profiling.clone();
+        profiling.adapter_timing = self.problem.adapter_timing_snapshot();
+        profiling
     }
 }
 
-impl<P> BasicProblem for IpoptProblemAdapter<'_, P>
+impl<P, C> BasicProblem for IpoptProblemAdapter<'_, P, C>
 where
     P: CompiledNlpProblem,
+    C: IpoptIterationConsumer,
 {
     fn num_variables(&self) -> usize {
         self.problem.dimension()
@@ -268,19 +487,32 @@ where
     }
 
     fn objective(&self, x: &[Number], _new_x: bool, obj: &mut Number) -> bool {
+        let started = Instant::now();
         *obj = self.problem.objective_value(x, self.parameters);
+        self.runtime
+            .borrow_mut()
+            .profiling
+            .objective_value
+            .record(started.elapsed());
         true
     }
 
     fn objective_grad(&self, x: &[Number], _new_x: bool, grad_f: &mut [Number]) -> bool {
+        let started = Instant::now();
         self.problem.objective_gradient(x, self.parameters, grad_f);
+        self.runtime
+            .borrow_mut()
+            .profiling
+            .objective_gradient
+            .record(started.elapsed());
         true
     }
 }
 
-impl<P> NewtonProblem for IpoptProblemAdapter<'_, P>
+impl<P, C> NewtonProblem for IpoptProblemAdapter<'_, P, C>
 where
     P: CompiledNlpProblem,
+    C: IpoptIterationConsumer,
 {
     fn num_hessian_non_zeros(&self) -> usize {
         self.problem.lagrangian_hessian_ccs().nnz()
@@ -297,9 +529,10 @@ where
     }
 }
 
-impl<P> ConstrainedProblem for IpoptProblemAdapter<'_, P>
+impl<P, C> ConstrainedProblem for IpoptProblemAdapter<'_, P, C>
 where
     P: CompiledNlpProblem,
+    C: IpoptIterationConsumer,
 {
     fn num_constraints(&self) -> usize {
         self.problem.equality_count() + self.problem.inequality_count()
@@ -310,12 +543,18 @@ where
     }
 
     fn constraint(&self, x: &[Number], _new_x: bool, g: &mut [Number]) -> bool {
+        let started = Instant::now();
         let equality_count = self.problem.equality_count();
         let (equality_out, inequality_out) = g.split_at_mut(equality_count);
         self.problem
             .equality_values(x, self.parameters, equality_out);
         self.problem
             .inequality_values(x, self.parameters, inequality_out);
+        self.runtime
+            .borrow_mut()
+            .profiling
+            .constraint_values
+            .record(started.elapsed());
         true
     }
 
@@ -341,12 +580,18 @@ where
     }
 
     fn constraint_jacobian_values(&self, x: &[Number], _new_x: bool, vals: &mut [Number]) -> bool {
+        let started = Instant::now();
         let equality_nnz = self.problem.equality_jacobian_ccs().nnz();
         let (equality_vals, inequality_vals) = vals.split_at_mut(equality_nnz);
         self.problem
             .equality_jacobian_values(x, self.parameters, equality_vals);
         self.problem
             .inequality_jacobian_values(x, self.parameters, inequality_vals);
+        self.runtime
+            .borrow_mut()
+            .profiling
+            .constraint_jacobian_values
+            .record(started.elapsed());
         true
     }
 
@@ -368,6 +613,7 @@ where
         lambda: &[Number],
         vals: &mut [Number],
     ) -> bool {
+        let started = Instant::now();
         let equality_count = self.problem.equality_count();
         let (equality_multipliers, inequality_multipliers) = lambda.split_at(equality_count);
         let mut objective_hessian = vec![0.0; vals.len()];
@@ -388,6 +634,11 @@ where
         for (value, objective_value) in vals.iter_mut().zip(objective_hessian.iter()) {
             *value += (obj_factor - 1.0) * objective_value;
         }
+        self.runtime
+            .borrow_mut()
+            .profiling
+            .hessian_values
+            .record(started.elapsed());
         true
     }
 }
@@ -453,6 +704,20 @@ pub fn solve_nlp_ipopt<'a, P>(
 where
     P: CompiledNlpProblem,
 {
+    solve_nlp_ipopt_with_callback(problem, x0, parameters, options, |_| {})
+}
+
+pub fn solve_nlp_ipopt_with_callback<'a, P, C>(
+    problem: &'a P,
+    x0: &'a [f64],
+    parameters: &'a [ParameterMatrix<'a>],
+    options: &IpoptOptions,
+    callback: C,
+) -> std::result::Result<IpoptSummary, IpoptSolveError>
+where
+    P: CompiledNlpProblem,
+    C: FnMut(&IpoptIterationSnapshot),
+{
     validate_ipopt_compatibility(problem)
         .map_err(|err| IpoptSolveError::InvalidInput(err.to_string()))?;
     validate_parameter_inputs(problem, parameters)
@@ -464,8 +729,9 @@ where
             problem.dimension()
         )));
     }
+    let solve_started = Instant::now();
 
-    let adapter = IpoptProblemAdapter::new(problem, x0, parameters)?;
+    let adapter = IpoptProblemAdapter::new(problem, x0, parameters, callback)?;
     let total_constraint_count = problem.equality_count() + problem.inequality_count();
     if total_constraint_count == 0 {
         let mut solver =
@@ -484,9 +750,10 @@ where
             set_ipopt_option(&mut solver, "sb", "yes")?;
         }
         let journal_path = open_ipopt_journal(&mut solver);
-        solver.set_intermediate_callback(Some(IpoptProblemAdapter::record_iteration));
+        solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
         let solve_result = solver.solve();
         let status = solve_result.status;
+        let raw_status = IpoptRawStatus::from(status);
         let objective = solve_result.objective_value;
         let x = solve_result.solver_data.solution.primal_variables.to_vec();
         let lower_bound_multipliers = solve_result
@@ -501,13 +768,16 @@ where
             .to_vec();
         let iterations = solve_result.solver_data.problem.iterations;
         let snapshots = solve_result.solver_data.problem.snapshots.clone();
+        let mut profiling = solve_result.solver_data.problem.profiling();
+        profiling.total_time = solve_started.elapsed();
         let journal_output = read_ipopt_journal(journal_path);
         if !solve_status_is_success(status) {
             return Err(IpoptSolveError::Solve {
-                status,
+                status: raw_status,
                 iterations,
                 snapshots,
                 journal_output,
+                profiling: Box::new(profiling),
             });
         }
         return Ok(IpoptSummary {
@@ -518,7 +788,7 @@ where
             inequality_multipliers: Vec::new(),
             objective,
             iterations,
-            status,
+            status: raw_status,
             equality_inf_norm: 0.0,
             inequality_inf_norm: 0.0,
             primal_inf_norm: 0.0,
@@ -526,6 +796,7 @@ where
             complementarity_inf_norm: 0.0,
             snapshots,
             journal_output,
+            profiling,
         });
     }
 
@@ -551,10 +822,11 @@ where
         set_ipopt_option(&mut solver, "sb", "yes")?;
     }
     let journal_path = open_ipopt_journal(&mut solver);
-    solver.set_intermediate_callback(Some(IpoptProblemAdapter::record_iteration));
+    solver.set_intermediate_callback(Some(IpoptProblemAdapter::<P, C>::record_iteration));
 
     let solve_result = solver.solve();
     let status = solve_result.status;
+    let raw_status = IpoptRawStatus::from(status);
     let objective = solve_result.objective_value;
     let x = solve_result.solver_data.solution.primal_variables.to_vec();
     let lower_bound_multipliers = solve_result
@@ -569,6 +841,8 @@ where
         .to_vec();
     let iterations = solve_result.solver_data.problem.iterations;
     let snapshots = solve_result.solver_data.problem.snapshots.clone();
+    let mut profiling = solve_result.solver_data.problem.profiling();
+    profiling.total_time = solve_started.elapsed();
     let journal_output = read_ipopt_journal(journal_path);
     let constraint_multipliers = solve_result
         .solver_data
@@ -577,10 +851,11 @@ where
         .to_vec();
     if !solve_status_is_success(status) {
         return Err(IpoptSolveError::Solve {
-            status,
+            status: raw_status,
             iterations,
             snapshots,
             journal_output,
+            profiling: Box::new(profiling),
         });
     }
 
@@ -625,7 +900,7 @@ where
         inequality_multipliers,
         objective,
         iterations,
-        status,
+        status: raw_status,
         equality_inf_norm,
         inequality_inf_norm,
         primal_inf_norm,
@@ -633,5 +908,6 @@ where
         complementarity_inf_norm,
         snapshots,
         journal_output,
+        profiling,
     })
 }

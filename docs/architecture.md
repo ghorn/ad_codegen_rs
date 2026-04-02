@@ -61,8 +61,16 @@ flowchart LR
 - the public API is the typed scalar-structured layer
 - the raw symbolic spec is an internal implementation detail
 - runtime variable and nonlinear constraint bounds are applied at solve time
+- the same source type also drives numeric flatten/unflatten and generated borrowed views
 
-Structured borrowed views and flatten/unflatten runtime helpers are still deferred. The current public layer uses typed `SX` leaves plus runtime flattening internally.
+Current typed layout scope:
+
+- scalar leaves
+- fixed arrays
+- nested structs
+- const-generic container structs
+
+The public layer still avoids a more ambitious reflective schema system; it uses typed `SX` leaves and generated flattening/view helpers instead.
 
 ## Testing model
 

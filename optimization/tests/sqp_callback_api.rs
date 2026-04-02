@@ -1,13 +1,16 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, ClarabelSqpError, ClarabelSqpOptions, CompiledNlpProblem, NonFiniteCallbackStage,
-    NonFiniteInputStage, ParameterMatrix, SqpFinalStateKind, SqpIterationEvent, SqpIterationPhase,
-    SqpTermination, SymbolicNlpOutputs, TypedRuntimeNlpBounds, solve_nlp_sqp,
-    solve_nlp_sqp_with_callback, symbolic_nlp,
+    NonFiniteInputStage, ParameterMatrix, SqpConeKind, SqpFinalStateKind, SqpIterationEvent,
+    SqpIterationPhase, SqpQpFailureDiagnostics, SqpQpRawStatus, SqpTermination, SymbolicNlpOutputs,
+    TypedRuntimeNlpBounds, solve_nlp_sqp, solve_nlp_sqp_with_callback, symbolic_nlp,
 };
 use rstest::rstest;
 use std::sync::OnceLock;
 use sx_core::SX;
+
+#[cfg(feature = "serde")]
+use serde_json;
 
 #[derive(Clone, optimization::Vectorize)]
 struct Pair<T> {
@@ -33,13 +36,14 @@ fn empty_ccs_1d() -> &'static CCS {
 }
 
 fn unconstrained_rosenbrock_problem() -> optimization::TypedCompiledJitNlp<Pair<SX>, (), (), ()> {
-    let symbolic =
-        symbolic_nlp::<Pair<SX>, (), (), (), _>("telemetry_rosenbrock", |x, _| SymbolicNlpOutputs {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), (), (), _>("telemetry_rosenbrock", |x, _| {
+        SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
             equalities: (),
             inequalities: (),
-        })
-        .expect("symbolic NLP should build");
+        }
+    })
+    .expect("symbolic NLP should build");
     symbolic.compile_jit().expect("JIT compile should succeed")
 }
 
@@ -665,7 +669,10 @@ fn sqp_callback_rosenbrock_reports_line_search_telemetry() {
         }
         if let Some(line_search) = &snapshot.line_search {
             assert!(line_search.armijo_satisfied);
-            assert_eq!(line_search.rejected_trials.len(), line_search.backtrack_count);
+            assert_eq!(
+                line_search.rejected_trials.len(),
+                line_search.backtrack_count
+            );
             for trial in &line_search.rejected_trials {
                 assert!(!trial.armijo_satisfied || trial.wolfe_satisfied == Some(false));
             }
@@ -697,9 +704,10 @@ fn sqp_callback_exposes_wolfe_status_when_enabled() {
     assert!(line_search.violation_satisfied);
     assert!(line_search.rejected_trials.is_empty());
     assert!(snapshots.iter().all(|snapshot| {
-        snapshot.line_search.as_ref().is_none_or(|line_search| {
-            line_search.wolfe_satisfied.is_some()
-        })
+        snapshot
+            .line_search
+            .as_ref()
+            .is_none_or(|line_search| line_search.wolfe_satisfied.is_some())
     }));
 }
 
@@ -752,15 +760,15 @@ fn sqp_callback_exposes_post_convergence_snapshot() {
 
 #[test]
 fn sqp_marks_armijo_tolerance_adjusted_acceptance() {
-    let symbolic =
-        symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>("telemetry_parameterized_quadratic", |x, p| {
-            SymbolicNlpOutputs {
-                objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
-                equalities: x.x + x.y,
-                inequalities: (),
-            }
-        })
-        .expect("symbolic NLP should build");
+    let symbolic = symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>(
+        "telemetry_parameterized_quadratic",
+        |x, p| SymbolicNlpOutputs {
+            objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
+            equalities: x.x + x.y,
+            inequalities: (),
+        },
+    )
+    .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
     let mut snapshots = Vec::new();
     let options = ClarabelSqpOptions {
@@ -824,7 +832,16 @@ fn sqp_qp_failure_diagnostics_surface_on_infeasible_case() {
             assert_eq!(qp_failure.constraint_count, 1);
             assert!(!qp_failure.cones.is_empty());
             assert!(!qp_failure.elastic_recovery);
-            assert_eq!(qp_failure.qp_info.raw_status, clarabel::solver::SolverStatus::PrimalInfeasible);
+            assert_eq!(
+                qp_failure.qp_info.raw_status,
+                SqpQpRawStatus::PrimalInfeasible
+            );
+            assert!(
+                qp_failure
+                    .cones
+                    .iter()
+                    .any(|cone| matches!(cone.kind, SqpConeKind::Zero))
+            );
             #[cfg(unix)]
             assert!(
                 qp_failure
@@ -935,4 +952,103 @@ fn sqp_rejects_non_finite_callback_outputs(#[case] stage: NonFiniteCallbackStage
         }
         other => panic!("expected NonFiniteCallbackOutput error, got {other:?}"),
     }
+}
+
+#[test]
+fn typed_symbolic_jit_problem_reports_adapter_timing() {
+    let compiled = unconstrained_rosenbrock_problem();
+    let mut snapshots = Vec::new();
+    let summary = compiled
+        .solve_sqp_with_callback(
+            &Pair { x: -1.2, y: 1.0 },
+            &(),
+            &TypedRuntimeNlpBounds::default(),
+            &quiet_options(),
+            |snapshot| snapshots.push(snapshot.clone()),
+        )
+        .expect("solve should succeed");
+
+    assert!(summary.profiling.adapter_timing.is_some());
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.timing.adapter_timing.is_some())
+    );
+}
+
+#[test]
+fn handwritten_problem_leaves_adapter_timing_unavailable() {
+    let mut snapshots = Vec::new();
+    let summary = solve_nlp_sqp_with_callback(
+        &OneDimQuadraticProblem,
+        &[3.0],
+        &[],
+        &quiet_options(),
+        |snapshot| snapshots.push(snapshot.clone()),
+    )
+    .expect("solve should succeed");
+
+    assert!(summary.profiling.adapter_timing.is_none());
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.timing.adapter_timing.is_none())
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn sqp_summary_serializes_with_duration_seconds() {
+    let compiled = unconstrained_rosenbrock_problem();
+    let summary = compiled
+        .solve_sqp(
+            &Pair { x: -1.2, y: 1.0 },
+            &(),
+            &TypedRuntimeNlpBounds::default(),
+            &quiet_options(),
+        )
+        .expect("solve should succeed");
+
+    let json = serde_json::to_value(&summary).expect("summary should serialize");
+    assert!(json["profiling"]["objective_value"]["calls"].is_number());
+    assert!(json["profiling"]["objective_value"]["total_time"].is_number());
+    assert!(json["profiling"]["total_time"].is_number());
+
+    let roundtrip: optimization::ClarabelSqpSummary =
+        serde_json::from_value(json).expect("summary should deserialize");
+    assert_eq!(roundtrip.termination, summary.termination);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn sqp_qp_failure_diagnostics_serialize_cleanly() {
+    let problem = InfeasibleLinearizedEqualityProblem;
+    let error = solve_nlp_sqp(
+        &problem,
+        &[0.0],
+        &[],
+        &ClarabelSqpOptions {
+            elastic_mode: false,
+            ..quiet_options()
+        },
+    )
+    .expect_err("infeasible linearized equality should fail the QP");
+
+    let qp_failure = match error {
+        ClarabelSqpError::QpSolve { context, .. } => context
+            .qp_failure
+            .expect("failed QP should expose diagnostics"),
+        other => panic!("expected QpSolve error, got {other:?}"),
+    };
+
+    let json = serde_json::to_value(&qp_failure).expect("diagnostics should serialize");
+    assert!(json["cones"].is_array());
+    assert_eq!(json["qp_info"]["raw_status"], "PrimalInfeasible");
+
+    let roundtrip: SqpQpFailureDiagnostics =
+        serde_json::from_value(json).expect("diagnostics should deserialize");
+    assert_eq!(
+        roundtrip.qp_info.raw_status,
+        SqpQpRawStatus::PrimalInfeasible
+    );
 }

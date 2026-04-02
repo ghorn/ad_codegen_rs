@@ -1,7 +1,7 @@
 #![cfg(feature = "ipopt")]
 
 use approx::assert_abs_diff_eq;
-use optimization::{IpoptOptions, ParameterMatrix, solve_nlp_ipopt};
+use optimization::{IpoptOptions, ParameterMatrix, solve_nlp_ipopt, solve_nlp_ipopt_with_callback};
 use rstest::rstest;
 
 #[path = "support/generated_problem.rs"]
@@ -42,6 +42,45 @@ fn solve_ok<P: optimization::CompiledNlpProblem>(
         Ok(summary) => summary,
         Err(err) => unreachable!("asserted success: {err}"),
     }
+}
+
+#[rstest]
+fn ipopt_callback_exposes_snapshots(
+    #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
+) {
+    let problem = build_problem_ok(simple_nlp_problem(backend), backend);
+    let mut snapshots = Vec::new();
+    let summary = solve_nlp_ipopt_with_callback(
+        &problem,
+        &[0.0, 0.0],
+        &[],
+        &IpoptOptions::default(),
+        |snapshot| snapshots.push(snapshot.clone()),
+    )
+    .expect("Ipopt solve should succeed");
+
+    assert!(!snapshots.is_empty());
+    assert_eq!(
+        snapshots.last().map(|snapshot| snapshot.iteration),
+        Some(summary.iterations)
+    );
+}
+
+#[cfg(feature = "serde")]
+#[rstest]
+fn ipopt_summary_serializes_with_duration_seconds(
+    #[values(CallbackBackend::Aot, CallbackBackend::Jit)] backend: CallbackBackend,
+) {
+    let problem = build_problem_ok(simple_nlp_problem(backend), backend);
+    let summary = solve_ok(&problem, &[0.0, 0.0], &[], IpoptOptions::default());
+
+    let json = serde_json::to_value(&summary).expect("summary should serialize");
+    assert!(json["profiling"]["objective_value"]["total_time"].is_number());
+    assert!(json["profiling"]["total_time"].is_number());
+
+    let roundtrip: optimization::IpoptSummary =
+        serde_json::from_value(json).expect("summary should deserialize");
+    assert_eq!(roundtrip.status, summary.status);
 }
 
 #[test]

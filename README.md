@@ -18,8 +18,7 @@ The current public optimization path is:
 - build the NLP with `optimization::symbolic_nlp(...)`
 - JIT-compile it with `.compile_jit()`
 - solve it with runtime variable / constraint bounds
-
-Structured borrowed views and flatten/unflatten runtime layout helpers are still deferred.
+- project flat numeric buffers back into generated typed borrowed views with `optimization::flat_view(...)`
 
 ## Using From Another Project
 
@@ -144,7 +143,7 @@ cargo test -p optimization --features ipopt ipopt_solves_hanging_chain -- --noca
 
 ```rust
 use optimization::{
-    ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, symbolic_nlp,
+    ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
 };
 use sx_core::SX;
 
@@ -156,7 +155,8 @@ struct Pair<T> {
 
 let symbolic = symbolic_nlp::<Pair<SX>, (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
     objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-    constraints: (),
+    equalities: (),
+    inequalities: (),
 })?;
 
 let compiled = symbolic.compile_jit()?;
@@ -166,6 +166,8 @@ let summary = compiled.solve_sqp(
     &TypedRuntimeNlpBounds::default(),
     &ClarabelSqpOptions::default(),
 )?;
+
+let state: PairView<'_, f64> = flat_view::<Pair<f64>, f64>(&summary.x)?;
 ```
 
 ## Reports
@@ -207,6 +209,7 @@ The symbolic evaluator used in tests is intentionally test-only. Public/runtime 
 - [docs/getting-started.md](/Users/greg/dev/ad_codegen/docs/getting-started.md)
 - [docs/architecture.md](/Users/greg/dev/ad_codegen/docs/architecture.md)
 - [docs/symbolic-nlp.md](/Users/greg/dev/ad_codegen/docs/symbolic-nlp.md)
+- [docs/upstream-followup.md](/Users/greg/dev/ad_codegen/docs/upstream-followup.md)
 - [docs/testing.md](/Users/greg/dev/ad_codegen/docs/testing.md)
 
 ## License

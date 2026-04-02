@@ -58,6 +58,12 @@ Both LLVM AOT and LLVM JIT backends are exercised.
 There are also public-surface tests for:
 
 - `#[derive(Vectorize)]` -> `symbolic_nlp(...)` -> `compile_jit()` -> `solve_sqp(...)`
+- `#[derive(Vectorize)]` -> `symbolic_nlp(...)` -> `compile_jit()` -> `solve_interior_point(...)`
+- `#[derive(Vectorize)]` -> `symbolic_nlp(...)` -> `compile_jit()` -> `solve_ipopt(...)`
+- generated borrowed views projected from solver result buffers
+- nested and const-generic layout roundtrips
 - typed SQP iteration callbacks
+- feature-gated serde roundtrips for public SQP transport DTOs
+- feature-gated serde roundtrips for native IP and IPOPT transport DTOs
 - honest optional metrics in snapshots and summaries
 - strict non-finite input / callback rejection

@@ -4,6 +4,8 @@ use clarabel::solver::SupportedConeT::{NonnegativeConeT, ZeroConeT};
 use clarabel::solver::implementations::default::DefaultSettingsBuilder;
 use clarabel::solver::{DefaultSolver, IPSolver, SolverStatus};
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
@@ -23,16 +25,17 @@ mod vectorize;
 
 pub use interior_point::{
     InteriorPointIterationEvent, InteriorPointIterationPhase, InteriorPointIterationSnapshot,
-    InteriorPointLinearSolver, InteriorPointOptions, InteriorPointProfiling,
-    InteriorPointSolveError, InteriorPointSummary, solve_nlp_interior_point,
-    solve_nlp_interior_point_with_callback,
+    InteriorPointIterationTiming, InteriorPointLinearSolver, InteriorPointOptions,
+    InteriorPointProfiling, InteriorPointSolveError, InteriorPointSummary,
+    solve_nlp_interior_point, solve_nlp_interior_point_with_callback,
 };
 #[cfg(feature = "ipopt")]
 pub use ipopt::SolveStatus as IpoptSolveStatus;
 #[cfg(feature = "ipopt")]
 pub use ipopt_backend::{
-    IpoptIterationPhase, IpoptIterationSnapshot, IpoptMuStrategy, IpoptOptions, IpoptSolveError,
-    IpoptSummary, solve_nlp_ipopt,
+    IpoptIterationPhase, IpoptIterationSnapshot, IpoptIterationTiming, IpoptMuStrategy,
+    IpoptOptions, IpoptProfiling, IpoptRawStatus, IpoptSolveError, IpoptSummary, solve_nlp_ipopt,
+    solve_nlp_ipopt_with_callback,
 };
 pub use optimization_derive::Vectorize;
 pub use symbolic::{
@@ -49,16 +52,81 @@ pub type Index = usize;
 pub(crate) const NLP_INF: f64 = 1e20;
 const BOX_LABEL_WIDTH: usize = 13;
 
+#[cfg(feature = "serde")]
+mod duration_seconds_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(duration.as_secs_f64())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let seconds = f64::deserialize(deserializer)?;
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(serde::de::Error::custom(format!(
+                "expected non-negative finite seconds, got {seconds}"
+            )));
+        }
+        Ok(Duration::from_secs_f64(seconds))
+    }
+}
+
+#[cfg(feature = "serde")]
+mod option_duration_seconds_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        duration
+            .map(|value: Duration| value.as_secs_f64())
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let seconds = Option::<f64>::deserialize(deserializer)?;
+        seconds
+            .map(|seconds| {
+                if !seconds.is_finite() || seconds < 0.0 {
+                    Err(serde::de::Error::custom(format!(
+                        "expected non-negative finite seconds, got {seconds}"
+                    )))
+                } else {
+                    Ok(Duration::from_secs_f64(seconds))
+                }
+            })
+            .transpose()
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackendTimingMetadata {
+    #[cfg_attr(feature = "serde", serde(with = "option_duration_seconds_serde"))]
     pub function_creation_time: Option<Duration>,
+    #[cfg_attr(feature = "serde", serde(with = "option_duration_seconds_serde"))]
     pub derivative_generation_time: Option<Duration>,
+    #[cfg_attr(feature = "serde", serde(with = "option_duration_seconds_serde"))]
     pub jit_time: Option<Duration>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EvalTimingStat {
     pub calls: Index,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub total_time: Duration,
 }
 
@@ -69,6 +137,36 @@ impl EvalTimingStat {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SqpAdapterTiming {
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub callback_evaluation: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub output_marshalling: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
+    pub layout_projection: Duration,
+}
+
+pub type SolverAdapterTiming = SqpAdapterTiming;
+
+impl SqpAdapterTiming {
+    pub(crate) fn saturating_sub(self, baseline: Self) -> Self {
+        Self {
+            callback_evaluation: self
+                .callback_evaluation
+                .saturating_sub(baseline.callback_evaluation),
+            output_marshalling: self
+                .output_marshalling
+                .saturating_sub(baseline.output_marshalling),
+            layout_projection: self
+                .layout_projection
+                .saturating_sub(baseline.layout_projection),
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClarabelSqpProfiling {
     pub objective_value: EvalTimingStat,
@@ -88,8 +186,12 @@ pub struct ClarabelSqpProfiling {
     pub convergence_check_time: Duration,
     pub elastic_recovery_activations: Index,
     pub elastic_recovery_qp_solves: Index,
+    pub adapter_timing: Option<SqpAdapterTiming>,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub preprocessing_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub total_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub unaccounted_time: Duration,
     pub backend_timing: BackendTimingMetadata,
 }
@@ -198,6 +300,12 @@ pub trait CompiledNlpProblem {
     fn backend_timing_metadata(&self) -> BackendTimingMetadata {
         BackendTimingMetadata::default()
     }
+    fn adapter_timing_snapshot(&self) -> Option<SolverAdapterTiming> {
+        self.sqp_adapter_timing_snapshot()
+    }
+    fn sqp_adapter_timing_snapshot(&self) -> Option<SqpAdapterTiming> {
+        None
+    }
     fn equality_count(&self) -> Index;
     fn inequality_count(&self) -> Index;
     fn objective_value(&self, x: &[f64], parameters: &[ParameterMatrix<'_>]) -> f64;
@@ -282,6 +390,7 @@ impl Default for ClarabelSqpOptions {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqpIterationPhase {
     Initial,
@@ -289,6 +398,7 @@ pub enum SqpIterationPhase {
     PostConvergence,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqpIterationEvent {
     PenaltyUpdated,
@@ -300,6 +410,7 @@ pub enum SqpIterationEvent {
     MaxIterationsReached,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqpQpStatus {
     Solved,
@@ -307,6 +418,53 @@ pub enum SqpQpStatus {
     Failed,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqpQpRawStatus {
+    Unsolved,
+    Solved,
+    PrimalInfeasible,
+    DualInfeasible,
+    AlmostSolved,
+    AlmostPrimalInfeasible,
+    AlmostDualInfeasible,
+    MaxIterations,
+    MaxTime,
+    NumericalError,
+    InsufficientProgress,
+    CallbackTerminated,
+    Other(String),
+}
+
+impl From<SolverStatus> for SqpQpRawStatus {
+    fn from(status: SolverStatus) -> Self {
+        match status {
+            SolverStatus::Unsolved => Self::Unsolved,
+            SolverStatus::Solved => Self::Solved,
+            SolverStatus::PrimalInfeasible => Self::PrimalInfeasible,
+            SolverStatus::DualInfeasible => Self::DualInfeasible,
+            SolverStatus::AlmostSolved => Self::AlmostSolved,
+            SolverStatus::AlmostPrimalInfeasible => Self::AlmostPrimalInfeasible,
+            SolverStatus::AlmostDualInfeasible => Self::AlmostDualInfeasible,
+            SolverStatus::MaxIterations => Self::MaxIterations,
+            SolverStatus::MaxTime => Self::MaxTime,
+            SolverStatus::NumericalError => Self::NumericalError,
+            SolverStatus::InsufficientProgress => Self::InsufficientProgress,
+            SolverStatus::CallbackTerminated => Self::CallbackTerminated,
+        }
+    }
+}
+
+impl std::fmt::Display for SqpQpRawStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(label) => f.write_str(label),
+            _ => write!(f, "{self:?}"),
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqpTermination {
     Converged,
@@ -318,6 +476,7 @@ pub enum SqpTermination {
     NonFiniteCallbackOutput,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqpFinalStateKind {
     InitialPoint,
@@ -325,12 +484,14 @@ pub enum SqpFinalStateKind {
     TrialPoint,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NonFiniteInputStage {
     InitialGuess,
     ParameterValues { parameter_index: Index },
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NonFiniteCallbackStage {
     ObjectiveValue,
@@ -342,25 +503,43 @@ pub enum NonFiniteCallbackStage {
     LagrangianHessianValues,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SqpIterationTiming {
+    pub adapter_timing: Option<SqpAdapterTiming>,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub objective_value: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub objective_gradient: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub equality_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub inequality_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub equality_jacobian_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub inequality_jacobian_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub lagrangian_hessian_values: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub qp_setup: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub qp_solve: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub multiplier_estimation: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub line_search_evaluation: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub line_search_condition_checks: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub convergence_check: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub preprocess: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub total: Duration,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqpLineSearchTrial {
     pub alpha: f64,
@@ -374,6 +553,7 @@ pub struct SqpLineSearchTrial {
     pub violation_satisfied: bool,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqpLineSearchInfo {
     pub accepted_alpha: f64,
@@ -386,21 +566,44 @@ pub struct SqpLineSearchInfo {
     pub rejected_trials: Vec<SqpLineSearchTrial>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqpQpInfo {
     pub status: SqpQpStatus,
-    pub raw_status: SolverStatus,
+    pub raw_status: SqpQpRawStatus,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub setup_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "duration_seconds_serde"))]
     pub solve_time: Duration,
     pub iteration_count: Index,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqpConeKind {
+    Zero,
+    Nonnegative,
+    Other(String),
+}
+
+impl std::fmt::Display for SqpConeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => f.write_str("zero"),
+            Self::Nonnegative => f.write_str("nonnegative"),
+            Self::Other(label) => f.write_str(label),
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqpConeSummary {
-    pub kind: &'static str,
+    pub kind: SqpConeKind,
     pub dim: Index,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqpQpFailureDiagnostics {
     pub qp_info: SqpQpInfo,
@@ -415,6 +618,7 @@ pub struct SqpQpFailureDiagnostics {
     pub transcript: Option<String>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqpIterationSnapshot {
     pub iteration: Index,
@@ -433,6 +637,7 @@ pub struct SqpIterationSnapshot {
     pub events: Vec<SqpIterationEvent>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct ClarabelSqpSummary {
     pub x: Vec<f64>,
@@ -454,6 +659,7 @@ pub struct ClarabelSqpSummary {
     pub profiling: ClarabelSqpProfiling,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct SqpFailureContext {
     pub termination: SqpTermination,
@@ -479,7 +685,7 @@ pub enum ClarabelSqpError {
     Setup(String),
     #[error("clarabel returned status {status:?}")]
     QpSolve {
-        status: SolverStatus,
+        status: SqpQpRawStatus,
         context: Box<SqpFailureContext>,
     },
     #[error("unconstrained SQP subproblem solve failed")]
@@ -895,8 +1101,8 @@ where
         return Err(NonFiniteCallbackStage::ObjectiveValue);
     }
     let eq_inf = (!equality_values.is_empty()).then_some(inf_norm(equality_values));
-    let ineq_inf =
-        (!augmented_inequality_values.is_empty()).then_some(positive_part_inf_norm(augmented_inequality_values));
+    let ineq_inf = (!augmented_inequality_values.is_empty())
+        .then_some(positive_part_inf_norm(augmented_inequality_values));
     Ok(TrialEvaluation {
         objective: objective_value,
         merit: exact_merit_value(
@@ -926,7 +1132,11 @@ where
         iteration_callback_time,
         || problem.objective_gradient(request.x, request.parameters, workspace.trial_gradient),
     );
-    if workspace.trial_gradient.iter().any(|value| !value.is_finite()) {
+    if workspace
+        .trial_gradient
+        .iter()
+        .any(|value| !value.is_finite())
+    {
         return Err(NonFiniteCallbackStage::ObjectiveGradient);
     }
 
@@ -968,8 +1178,10 @@ where
         return Err(NonFiniteCallbackStage::InequalityJacobianValues);
     }
 
-    let equality_jacobian =
-        ccs_to_dense(problem.equality_jacobian_ccs(), workspace.trial_equality_jacobian_values);
+    let equality_jacobian = ccs_to_dense(
+        problem.equality_jacobian_ccs(),
+        workspace.trial_equality_jacobian_values,
+    );
     let nonlinear_inequality_jacobian = ccs_to_dense(
         problem.inequality_jacobian_ccs(),
         workspace.trial_inequality_jacobian_values,
@@ -1093,6 +1305,7 @@ struct TrialDerivativeRequest<'a> {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct IterationTimingBaseline {
+    adapter_timing: Option<SqpAdapterTiming>,
     objective_value: Duration,
     objective_gradient: Duration,
     equality_values: Duration,
@@ -1117,6 +1330,7 @@ struct IterationTimingBuckets {
 impl IterationTimingBaseline {
     fn capture(profiling: &ClarabelSqpProfiling) -> Self {
         Self {
+            adapter_timing: profiling.adapter_timing,
             objective_value: profiling.objective_value.total_time,
             objective_gradient: profiling.objective_gradient.total_time,
             equality_values: profiling.equality_values.total_time,
@@ -1134,6 +1348,9 @@ fn build_iteration_timing(
     buckets: IterationTimingBuckets,
 ) -> SqpIterationTiming {
     SqpIterationTiming {
+        adapter_timing: profiling
+            .adapter_timing
+            .map(|timing| timing.saturating_sub(baseline.adapter_timing.unwrap_or_default())),
         objective_value: profiling
             .objective_value
             .total_time
@@ -1174,18 +1391,19 @@ fn build_iteration_timing(
 }
 
 fn cone_summaries(cones: &[clarabel::solver::SupportedConeT<f64>]) -> Vec<SqpConeSummary> {
-    cones.iter()
+    cones
+        .iter()
         .map(|cone| match cone {
             clarabel::solver::SupportedConeT::ZeroConeT(dim) => SqpConeSummary {
-                kind: "zero",
+                kind: SqpConeKind::Zero,
                 dim: *dim,
             },
             clarabel::solver::SupportedConeT::NonnegativeConeT(dim) => SqpConeSummary {
-                kind: "nonnegative",
+                kind: SqpConeKind::Nonnegative,
                 dim: *dim,
             },
             _ => SqpConeSummary {
-                kind: "other",
+                kind: SqpConeKind::Other(format!("{cone:?}")),
                 dim: 0,
             },
         })
@@ -1682,6 +1900,21 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
         summary.profiling.line_search_evaluation_time,
         summary.profiling.line_search_condition_check_time,
         summary.profiling.convergence_check_time,
+        summary
+            .profiling
+            .adapter_timing
+            .map(|timing| timing.callback_evaluation)
+            .unwrap_or(Duration::ZERO),
+        summary
+            .profiling
+            .adapter_timing
+            .map(|timing| timing.output_marshalling)
+            .unwrap_or(Duration::ZERO),
+        summary
+            .profiling
+            .adapter_timing
+            .map(|timing| timing.layout_projection)
+            .unwrap_or(Duration::ZERO),
         summary.profiling.preprocessing_time,
         summary.profiling.unaccounted_time,
         summary.profiling.total_time,
@@ -1769,7 +2002,11 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
     ));
     lines.push(boxed_line(
         "",
-        timing_row("mult est", None, summary.profiling.multiplier_estimation_time),
+        timing_row(
+            "mult est",
+            None,
+            summary.profiling.multiplier_estimation_time,
+        ),
     ));
     lines.push(boxed_line(
         "",
@@ -1789,11 +2026,7 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
     ));
     lines.push(boxed_line(
         "",
-        timing_row(
-            "conv check",
-            None,
-            summary.profiling.convergence_check_time,
-        ),
+        timing_row("conv check", None, summary.profiling.convergence_check_time),
     ));
     lines.push(boxed_line(
         "elastic",
@@ -1803,6 +2036,20 @@ fn log_sqp_status_summary(summary: &ClarabelSqpSummary, options: &ClarabelSqpOpt
             summary.profiling.elastic_recovery_qp_solves,
         ),
     ));
+    if let Some(adapter_timing) = summary.profiling.adapter_timing {
+        lines.push(boxed_line(
+            "adapter",
+            timing_row("callback", None, adapter_timing.callback_evaluation),
+        ));
+        lines.push(boxed_line(
+            "",
+            timing_row("marshal", None, adapter_timing.output_marshalling),
+        ));
+        lines.push(boxed_line(
+            "",
+            timing_row("layout", None, adapter_timing.layout_projection),
+        ));
+    }
     lines.push(boxed_line(
         "",
         timing_row("preprocess", None, summary.profiling.preprocessing_time),
@@ -2214,7 +2461,7 @@ fn qp_status_info(
     };
     SqpQpInfo {
         status,
-        raw_status,
+        raw_status: raw_status.into(),
         setup_time,
         solve_time,
         iteration_count: iteration_count as Index,
@@ -2225,6 +2472,7 @@ fn qp_status_info(
 struct RawQpSolve {
     primal: Vec<f64>,
     dual: Vec<f64>,
+    solver_status: SolverStatus,
     qp_info: SqpQpInfo,
     qp_failure: Option<SqpQpFailureDiagnostics>,
 }
@@ -2308,6 +2556,7 @@ fn solve_clarabel_qp_from_dense(
     Ok(RawQpSolve {
         primal: solver.solution.x.clone(),
         dual: solver.solution.z.clone(),
+        solver_status: solver.solution.status,
         qp_info,
         qp_failure,
     })
@@ -2580,6 +2829,7 @@ where
     let mut elastic_mode_active = false;
     let mut elastic_mode_entry_primal_inf = 0.0;
     let mut elastic_mode_iters = 0;
+    profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
 
     if options.verbose {
         log_sqp_problem_header(problem, parameters, options);
@@ -2587,6 +2837,7 @@ where
 
     for iteration in 0..options.max_iters {
         let iteration_started = Instant::now();
+        profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
         let iteration_timing_baseline = IterationTimingBaseline::capture(&profiling);
         let mut iteration_callback_time = Duration::ZERO;
         let mut iteration_qp_setup_time = Duration::ZERO;
@@ -2708,6 +2959,7 @@ where
         let preprocess_duration = iteration_started
             .elapsed()
             .saturating_sub(iteration_callback_time);
+        profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
         let phase = if iteration == 0 {
             SqpIterationPhase::Initial
         } else if converged {
@@ -2749,6 +3001,7 @@ where
         }
         if converged {
             profiling.preprocessing_time += preprocess_duration;
+            profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
             finalize_profiling(&mut profiling, solve_started);
             let summary = ClarabelSqpSummary {
                 x: x.clone(),
@@ -2827,7 +3080,7 @@ where
                 upper_bound_multipliers: Vec::new(),
                 qp_info: SqpQpInfo {
                     status: SqpQpStatus::Solved,
-                    raw_status: SolverStatus::Solved,
+                    raw_status: SqpQpRawStatus::Solved,
                     setup_time: Duration::ZERO,
                     solve_time: Duration::ZERO,
                     iteration_count: 0,
@@ -2865,7 +3118,7 @@ where
             };
             if elastic_mode_active {
                 let elastic_qp = solve_elastic_recovery_qp(&elastic_model, options, &mut qp_ctx)?;
-                match elastic_qp.qp_info.raw_status {
+                match elastic_qp.solver_status {
                     SolverStatus::Solved | SolverStatus::AlmostSolved => {
                         decode_elastic_qp_solution(
                             elastic_qp,
@@ -2877,7 +3130,7 @@ where
                     }
                     status => {
                         return Err(ClarabelSqpError::QpSolve {
-                            status,
+                            status: status.into(),
                             context: failure_context_with_qp_failure(
                                 SqpTermination::QpSolve,
                                 Some(current_snapshot.clone()),
@@ -2898,7 +3151,7 @@ where
                     false,
                     &mut qp_ctx,
                 )?;
-                match normal_qp.qp_info.raw_status {
+                match normal_qp.solver_status {
                     SolverStatus::Solved | SolverStatus::AlmostSolved => decode_normal_qp_solution(
                         normal_qp,
                         equality_count,
@@ -2917,7 +3170,7 @@ where
                         qp_ctx.profiling.elastic_recovery_activations += 1;
                         let elastic_qp =
                             solve_elastic_recovery_qp(&elastic_model, options, &mut qp_ctx)?;
-                        match elastic_qp.qp_info.raw_status {
+                        match elastic_qp.solver_status {
                             SolverStatus::Solved | SolverStatus::AlmostSolved => {
                                 decode_elastic_qp_solution(
                                     elastic_qp,
@@ -2929,7 +3182,7 @@ where
                             }
                             status => {
                                 return Err(ClarabelSqpError::QpSolve {
-                                    status,
+                                    status: status.into(),
                                     context: failure_context_with_qp_failure(
                                         SqpTermination::QpSolve,
                                         Some(current_snapshot.clone()),
@@ -2943,7 +3196,7 @@ where
                     }
                     status => {
                         return Err(ClarabelSqpError::QpSolve {
-                            status,
+                            status: status.into(),
                             context: failure_context_with_qp_failure(
                                 SqpTermination::QpSolve,
                                 Some(current_snapshot.clone()),
@@ -3041,6 +3294,7 @@ where
             profiling.preprocessing_time += iteration_started.elapsed().saturating_sub(
                 iteration_callback_time + iteration_qp_setup_time + iteration_qp_solve_time,
             );
+            profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
             finalize_profiling(&mut profiling, solve_started);
             let summary = ClarabelSqpSummary {
                 x: x.clone(),
@@ -3231,7 +3485,8 @@ where
                     .expect("wolfe_c2 implies a trial directional derivative")
                     >= c2 * directional_derivative
             });
-            let violation_satisfied = trial_eval.primal_inf <= primal_inf.max(options.constraint_tol);
+            let violation_satisfied =
+                trial_eval.primal_inf <= primal_inf.max(options.constraint_tol);
             let line_search_check_elapsed = line_search_check_started.elapsed();
             iteration_line_search_condition_check_time += line_search_check_elapsed;
             profiling.line_search_condition_check_time += line_search_check_elapsed;
@@ -3273,8 +3528,7 @@ where
             armijo_tolerance_adjusted,
             wolfe_satisfied,
             violation_satisfied,
-        )) =
-            accepted_trial
+        )) = accepted_trial
         else {
             return Err(ClarabelSqpError::LineSearchFailed {
                 directional_derivative,
@@ -3345,6 +3599,7 @@ where
 
     let max_iteration = options.max_iters;
     let iteration_started = Instant::now();
+    profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
     let iteration_timing_baseline = IterationTimingBaseline::capture(&profiling);
     let mut iteration_callback_time = Duration::ZERO;
     time_callback(
@@ -3498,6 +3753,7 @@ where
     profiling.preprocessing_time += iteration_started
         .elapsed()
         .saturating_sub(iteration_callback_time);
+    profiling.adapter_timing = problem.sqp_adapter_timing_snapshot();
     finalize_profiling(&mut profiling, solve_started);
     Err(ClarabelSqpError::MaxIterations {
         iterations: options.max_iters,

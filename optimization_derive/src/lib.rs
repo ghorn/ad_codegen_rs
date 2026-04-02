@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Type,
-    parse_macro_input, parse_quote,
+    Data, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Type, parse_macro_input,
+    parse_quote,
 };
 
 #[proc_macro_derive(Vectorize)]

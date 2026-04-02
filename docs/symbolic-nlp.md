@@ -15,6 +15,9 @@ The old builder-style `SXMatrix` API and raw symbolic escape hatch are gone from
 - `optimization::symbolic_nlp(...)`
 - `TypedSymbolicNlp::compile_jit()`
 - `TypedCompiledJitNlp::solve_sqp(...)`
+- `TypedCompiledJitNlp::solve_interior_point(...)`
+- `TypedCompiledJitNlp::solve_ipopt(...)`
+- `optimization::flat_view(...)`
 - `solve_nlp_sqp_with_callback(...)`
 
 ## Why this shape
@@ -23,12 +26,13 @@ The old builder-style `SXMatrix` API and raw symbolic escape hatch are gone from
 - users define the NLP once as `(X, P) -> { objective, constraints }`
 - gradients, Jacobians, and exact Lagrangian Hessians are derived automatically
 - runtime variable bounds and nonlinear constraint bounds stay solver inputs, not compile-time state
+- the same source type also defines flatten order, owned roundtrips, and generated borrowed numeric views
 
 ## Example
 
 ```rust
 use optimization::{
-    ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, symbolic_nlp,
+    ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, flat_view, symbolic_nlp,
 };
 use sx_core::SX;
 
@@ -40,7 +44,8 @@ struct Pair<T> {
 
 let symbolic = symbolic_nlp::<Pair<SX>, (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
     objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-    constraints: (),
+    equalities: (),
+    inequalities: (),
 })?;
 
 let compiled = symbolic.compile_jit()?;
@@ -50,6 +55,9 @@ let summary = compiled.solve_sqp(
     &TypedRuntimeNlpBounds::default(),
     &ClarabelSqpOptions::default(),
 )?;
+
+let state: PairView<'_, f64> = flat_view::<Pair<f64>, f64>(&summary.x)?;
+assert_eq!(*state.x, 1.0);
 ```
 
 ## Vectorize scope
@@ -134,14 +142,44 @@ Failures are typed:
 - `ClarabelSqpError::NonFiniteInput`
 - `ClarabelSqpError::NonFiniteCallbackOutput`
 
-## Deferred work
+## Structured layout model
 
-Structured borrowed views and flatten/unflatten runtime layout helpers are still deferred.
+The typed layout layer now provides, from a single Rust source type:
 
-That includes:
+- symbolic construction with `SX` leaves
+- owned numeric flattening
+- owned numeric unflattening
+- generated borrowed numeric view types such as `AbView<'a, T>`
+- borrowed flat-slice projection with `flat_view::<Ab<f64>, f64>(...)`
 
-- typed borrowed solver-coordinate views
-- generated flatten/unflatten runtime adapters
-- structured-layout roundtrip tests
+The supported scope is still intentionally narrow:
 
-This pass keeps the symbolic/JIT NLP API typed, scalar-structured, and solver-focused.
+- scalar leaves only
+- fixed arrays
+- nested structs
+- const-generic container structs
+
+This keeps the symbolic/JIT NLP API typed, scalar-structured, and solver-focused without adding a broader schema/reflection system.
+
+## Solver transport and serde
+
+When the `optimization/serde` feature is enabled, the public SQP, native
+interior-point, and IPOPT callback / summary DTOs derive `Serialize` /
+`Deserialize`.
+
+The transport contract is:
+
+- timing fields stay `Duration` in Rust
+- timing fields serialize as floating-point seconds
+- aggregate callback timing stats serialize as `{ calls, total_time }`
+- unavailable metrics remain explicit `Option`/typed variants, not placeholder
+  `NaN` values
+
+The public SQP diagnostics payloads are also transport-safe and owned:
+
+- `SqpConeKind`
+- `SqpQpRawStatus`
+- `IpoptRawStatus`
+
+so downstream apps do not need their own mirror enums for Clarabel statuses or
+cone labels, and do not need to mirror upstream IPOPT status strings either.

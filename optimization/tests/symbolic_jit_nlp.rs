@@ -1,7 +1,10 @@
 use approx::assert_abs_diff_eq;
+use optimization::{
+    ClarabelSqpOptions, InteriorPointOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, flat_view,
+    symbolic_nlp,
+};
 #[cfg(feature = "ipopt")]
-use optimization::IpoptOptions;
-use optimization::{ClarabelSqpOptions, SymbolicNlpOutputs, TypedRuntimeNlpBounds, symbolic_nlp};
+use optimization::{IpoptOptions, IpoptRawStatus};
 use sx_core::SX;
 
 #[derive(Clone, optimization::Vectorize)]
@@ -23,12 +26,13 @@ struct Chain<T, const N: usize> {
 
 #[test]
 fn typed_symbolic_rosenbrock_solves_end_to_end_with_jit() {
-    let symbolic = symbolic_nlp::<Pair<SX>, (), (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
-        objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-        equalities: (),
-        inequalities: (),
-    })
-    .expect("symbolic NLP should build");
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, (), (), (), _>("rosenbrock", |x, _| SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: (),
+            inequalities: (),
+        })
+        .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
     let timing = compiled.backend_timing_metadata();
     let summary = compiled
@@ -54,20 +58,30 @@ fn typed_symbolic_rosenbrock_solves_end_to_end_with_jit() {
     assert_eq!(summary.equality_inf_norm, None);
     assert_eq!(summary.inequality_inf_norm, None);
     assert_eq!(summary.complementarity_inf_norm, None);
+
+    let final_view: PairView<'_, f64> =
+        flat_view::<Pair<f64>, f64>(&summary.x).expect("solver output should project into a view");
+    assert_abs_diff_eq!(*final_view.x, 1.0, epsilon = 1e-6);
+    assert_abs_diff_eq!(*final_view.y, 1.0, epsilon = 1e-6);
+    let snapshot_view: PairView<'_, f64> = flat_view::<Pair<f64>, f64>(&summary.final_state.x)
+        .expect("final snapshot should project into a view");
+    assert_abs_diff_eq!(*snapshot_view.x, 1.0, epsilon = 1e-6);
+    assert_abs_diff_eq!(*snapshot_view.y, 1.0, epsilon = 1e-6);
 }
 
 #[test]
 fn typed_symbolic_disk_constrained_rosenbrock_solves_with_runtime_constraint_bounds() {
-    let symbolic =
-        symbolic_nlp::<Pair<SX>, (), (), Pair<SX>, _>("disk_rosenbrock", |x, _| SymbolicNlpOutputs {
+    let symbolic = symbolic_nlp::<Pair<SX>, (), (), Pair<SX>, _>("disk_rosenbrock", |x, _| {
+        SymbolicNlpOutputs {
             objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
             equalities: (),
             inequalities: Pair {
                 x: x.x.sqr() + x.y.sqr(),
                 y: x.y,
             },
-        })
-        .expect("symbolic NLP should build");
+        }
+    })
+    .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
     let summary = compiled
         .solve_sqp(
@@ -173,14 +187,15 @@ fn typed_symbolic_hanging_chain_solves_end_to_end() {
 
 #[test]
 fn typed_symbolic_parameterized_nlp_solves_end_to_end() {
-    let symbolic = symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>("parameterized_quadratic", |x, p| {
-        SymbolicNlpOutputs {
-            objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
-            equalities: x.x + x.y,
-            inequalities: (),
-        }
-    })
-    .expect("symbolic NLP should build");
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, Pair<SX>, SX, (), _>("parameterized_quadratic", |x, p| {
+            SymbolicNlpOutputs {
+                objective: (x.x - p.x).sqr() + (x.y - p.y).sqr(),
+                equalities: x.x + x.y,
+                inequalities: (),
+            }
+        })
+        .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
     let summary = compiled
         .solve_sqp(
@@ -255,17 +270,18 @@ fn typed_symbolic_rosenbrock_solves_with_ipopt_without_box_bounds() {
 #[cfg(feature = "ipopt")]
 #[test]
 fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds() {
-    let symbolic = symbolic_nlp::<Pair<SX>, (), (), Pair<SX>, _>("disk_rosenbrock_ipopt", |x, _| {
-        SymbolicNlpOutputs {
-            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
-            equalities: (),
-            inequalities: Pair {
-                x: x.x.sqr() + x.y.sqr(),
-                y: x.y,
-            },
-        }
-    })
-    .expect("symbolic NLP should build");
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, (), (), Pair<SX>, _>("disk_rosenbrock_ipopt", |x, _| {
+            SymbolicNlpOutputs {
+                objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+                equalities: (),
+                inequalities: Pair {
+                    x: x.x.sqr() + x.y.sqr(),
+                    y: x.y,
+                },
+            }
+        })
+        .expect("symbolic NLP should build");
     let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
     let summary = compiled
         .solve_ipopt(
@@ -293,4 +309,78 @@ fn typed_symbolic_inequality_only_problem_solves_with_ipopt_without_box_bounds()
     assert!(summary.complementarity_inf_norm <= 1e-6);
     assert!(summary.objective < 10.0);
     assert!(summary.x[0].powi(2) + summary.x[1].powi(2) <= 1.5 + 1e-5);
+}
+
+#[test]
+fn typed_symbolic_problem_reports_adapter_timing_with_interior_point() {
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, (), (), (), _>("rosenbrock_ip", |x, _| SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: (),
+            inequalities: (),
+        })
+        .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let mut snapshots = Vec::new();
+    let summary = compiled
+        .solve_interior_point_with_callback(
+            &Pair { x: -1.2, y: 1.0 },
+            &(),
+            &TypedRuntimeNlpBounds::default(),
+            &InteriorPointOptions {
+                max_iters: 120,
+                dual_tol: 1e-6,
+                verbose: false,
+                ..InteriorPointOptions::default()
+            },
+            |snapshot| snapshots.push(snapshot.clone()),
+        )
+        .expect("interior-point solve should succeed");
+
+    assert!(summary.profiling.adapter_timing.is_some());
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.timing.adapter_timing.is_some())
+    );
+}
+
+#[cfg(feature = "ipopt")]
+#[test]
+fn typed_symbolic_problem_reports_adapter_timing_with_ipopt() {
+    let symbolic =
+        symbolic_nlp::<Pair<SX>, (), (), (), _>("rosenbrock_ipopt_cb", |x, _| SymbolicNlpOutputs {
+            objective: (1.0 - x.x).sqr() + 100.0 * (x.y - x.x.sqr()).sqr(),
+            equalities: (),
+            inequalities: (),
+        })
+        .expect("symbolic NLP should build");
+    let compiled = symbolic.compile_jit().expect("JIT compile should succeed");
+    let mut snapshots = Vec::new();
+    let summary = compiled
+        .solve_ipopt_with_callback(
+            &Pair { x: -1.2, y: 1.0 },
+            &(),
+            &TypedRuntimeNlpBounds::default(),
+            &IpoptOptions {
+                max_iters: 120,
+                tol: 1e-9,
+                ..IpoptOptions::default()
+            },
+            |snapshot| snapshots.push(snapshot.clone()),
+        )
+        .expect("Ipopt solve should succeed");
+
+    assert!(matches!(
+        summary.status,
+        IpoptRawStatus::SolveSucceeded
+            | IpoptRawStatus::SolvedToAcceptableLevel
+            | IpoptRawStatus::FeasiblePointFound
+    ));
+    assert!(summary.profiling.adapter_timing.is_some());
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.timing.adapter_timing.is_some())
+    );
 }

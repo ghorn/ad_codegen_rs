@@ -1,7 +1,8 @@
 use approx::assert_abs_diff_eq;
 use optimization::{
     CCS, CompiledNlpProblem, InteriorPointLinearSolver, InteriorPointOptions, ParameterMatrix,
-    solve_nlp_interior_point, validate_nlp_problem_shapes, validate_parameter_inputs,
+    solve_nlp_interior_point, solve_nlp_interior_point_with_callback, validate_nlp_problem_shapes,
+    validate_parameter_inputs,
 };
 use rstest::rstest;
 
@@ -146,6 +147,51 @@ fn solve_ok<P: CompiledNlpProblem>(
         Ok(summary) => summary,
         Err(err) => unreachable!("asserted success: {err}"),
     }
+}
+
+#[test]
+fn interior_point_handwritten_problem_leaves_adapter_timing_unavailable() {
+    let mut snapshots = Vec::new();
+    let summary = solve_nlp_interior_point_with_callback(
+        &BoundConstrainedQuadraticProblem,
+        &[0.0, 0.0],
+        &[],
+        &InteriorPointOptions {
+            verbose: false,
+            ..InteriorPointOptions::default()
+        },
+        |snapshot| snapshots.push(snapshot.clone()),
+    )
+    .expect("interior-point solve should succeed");
+
+    assert!(summary.profiling.adapter_timing.is_none());
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.timing.adapter_timing.is_none())
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn interior_point_summary_serializes_with_duration_seconds() {
+    let summary = solve_ok(
+        &BoundConstrainedQuadraticProblem,
+        &[0.0, 0.0],
+        &[],
+        InteriorPointOptions {
+            verbose: false,
+            ..InteriorPointOptions::default()
+        },
+    );
+
+    let json = serde_json::to_value(&summary).expect("summary should serialize");
+    assert!(json["profiling"]["objective_value"]["total_time"].is_number());
+    assert!(json["profiling"]["total_time"].is_number());
+
+    let roundtrip: optimization::InteriorPointSummary =
+        serde_json::from_value(json).expect("summary should deserialize");
+    assert_eq!(roundtrip.iterations, summary.iterations);
 }
 
 #[test]

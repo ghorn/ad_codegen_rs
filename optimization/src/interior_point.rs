@@ -1,6 +1,8 @@
 use clarabel::algebra::CscMatrix;
 use clarabel::qdldl::{QDLDLFactorisation, QDLDLSettings};
 use nalgebra::{DMatrix, DVector};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -8,15 +10,15 @@ use super::{
     BackendTimingMetadata, BoundConstraints, CompiledNlpProblem, EvalTimingStat, Index,
     ParameterMatrix, SQP_EVENT_SEEN_LINE_SEARCH, SQP_EVENT_SEEN_MAX_ITER, SQP_EVENT_SEEN_PENALTY,
     SQP_LOG_HAS_EQUALITIES, SQP_LOG_HAS_INEQUALITIES, SQP_LOG_ITERATION_LIMIT_REACHED,
-    SQP_LOG_PENALTY_UPDATED, SqpEventLegendState, augment_inequality_values, boxed_line,
-    build_bound_jacobian, ccs_to_dense, choose_summary_duration_unit, collect_bound_constraints,
-    compact_duration_text, complementarity_inf_norm, declared_box_constraint_count,
-    dense_fill_percent, fmt_duration_in_unit, fmt_optional_duration_in_unit, inf_norm,
-    lagrangian_gradient, log_boxed_section, lower_tri_fill_percent,
-    lower_triangle_to_symmetric_dense, positive_part_inf_norm, regularize_hessian, sci_text,
-    split_augmented_inequality_multipliers, style_bold, style_cyan_bold, style_green_bold,
-    style_red_bold, style_yellow_bold, time_callback, validate_nlp_problem_shapes,
-    validate_parameter_inputs,
+    SQP_LOG_PENALTY_UPDATED, SolverAdapterTiming, SqpEventLegendState, augment_inequality_values,
+    boxed_line, build_bound_jacobian, ccs_to_dense, choose_summary_duration_unit,
+    collect_bound_constraints, compact_duration_text, complementarity_inf_norm,
+    declared_box_constraint_count, dense_fill_percent, fmt_duration_in_unit,
+    fmt_optional_duration_in_unit, inf_norm, lagrangian_gradient, log_boxed_section,
+    lower_tri_fill_percent, lower_triangle_to_symmetric_dense, positive_part_inf_norm,
+    regularize_hessian, sci_text, split_augmented_inequality_multipliers, style_bold,
+    style_cyan_bold, style_green_bold, style_red_bold, style_yellow_bold, time_callback,
+    validate_nlp_problem_shapes, validate_parameter_inputs,
 };
 
 const IP_LOG_LINEAR_FALLBACK: u8 = 1 << 4;
@@ -25,6 +27,7 @@ const AUTO_SPARSE_QDLDL_MIN_DIM: usize = 10;
 const LINEAR_SOLUTION_MAX_RELATIVE_INF_NORM: f64 = 1e12;
 const LINEAR_SOLUTION_MAX_RELATIVE_RESIDUAL: f64 = 1e-7;
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointLinearSolver {
     Auto,
@@ -44,6 +47,7 @@ impl InteriorPointLinearSolver {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct InteriorPointOptions {
     pub max_iters: Index,
@@ -83,6 +87,7 @@ impl Default for InteriorPointOptions {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InteriorPointProfiling {
     pub objective_value: EvalTimingStat,
@@ -93,11 +98,17 @@ pub struct InteriorPointProfiling {
     pub inequality_jacobian_values: EvalTimingStat,
     pub lagrangian_hessian_values: EvalTimingStat,
     pub kkt_assemblies: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub kkt_assembly_time: Duration,
     pub linear_solves: Index,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub linear_solve_time: Duration,
+    pub adapter_timing: Option<SolverAdapterTiming>,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub preprocessing_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub total_time: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
     pub unaccounted_time: Duration,
     pub backend_timing: BackendTimingMetadata,
 }
@@ -124,6 +135,7 @@ impl InteriorPointProfiling {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 pub struct InteriorPointSummary {
     pub x: Vec<f64>,
@@ -144,12 +156,14 @@ pub struct InteriorPointSummary {
     pub linear_solver: InteriorPointLinearSolver,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointIterationPhase {
     AcceptedStep,
     Converged,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPointIterationEvent {
     SigmaAdjusted,
@@ -158,6 +172,23 @@ pub enum InteriorPointIterationEvent {
     MaxIterationsReached,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InteriorPointIterationTiming {
+    pub adapter_timing: Option<SolverAdapterTiming>,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub callback: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub kkt_assembly: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub linear_solve: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub preprocess: Duration,
+    #[cfg_attr(feature = "serde", serde(with = "crate::duration_seconds_serde"))]
+    pub total: Duration,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InteriorPointIterationSnapshot {
     pub iteration: Index,
@@ -172,10 +203,16 @@ pub struct InteriorPointIterationSnapshot {
     pub alpha: Option<f64>,
     pub line_search_iterations: Option<Index>,
     pub linear_solver: InteriorPointLinearSolver,
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::option_duration_seconds_serde")
+    )]
     pub linear_solve_time: Option<Duration>,
+    pub timing: InteriorPointIterationTiming,
     pub events: Vec<InteriorPointIterationEvent>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Error)]
 pub enum InteriorPointSolveError {
     #[error("invalid interior-point input: {0}")]
@@ -290,6 +327,23 @@ fn barrier_parameter(slack: &[f64], multipliers: &[f64]) -> f64 {
             .sum::<f64>()
             / slack.len() as f64
     }
+}
+
+fn adapter_timing_delta<P>(
+    problem: &P,
+    previous: &mut Option<SolverAdapterTiming>,
+) -> Option<SolverAdapterTiming>
+where
+    P: CompiledNlpProblem,
+{
+    let current = problem.adapter_timing_snapshot();
+    let delta = match (current, *previous) {
+        (Some(current), Some(previous)) => Some(current.saturating_sub(previous)),
+        (Some(current), None) => Some(current),
+        (None, _) => None,
+    };
+    *previous = current;
+    delta
 }
 
 fn project_initial_point_into_box_interior(x: &mut [f64], bounds: &BoundConstraints) {
@@ -1194,6 +1248,21 @@ fn log_interior_point_status_summary(
         summary.profiling.total_time,
         summary
             .profiling
+            .adapter_timing
+            .map(|timing| timing.callback_evaluation)
+            .unwrap_or(Duration::ZERO),
+        summary
+            .profiling
+            .adapter_timing
+            .map(|timing| timing.output_marshalling)
+            .unwrap_or(Duration::ZERO),
+        summary
+            .profiling
+            .adapter_timing
+            .map(|timing| timing.layout_projection)
+            .unwrap_or(Duration::ZERO),
+        summary
+            .profiling
             .backend_timing
             .function_creation_time
             .unwrap_or(Duration::ZERO),
@@ -1218,6 +1287,16 @@ fn log_interior_point_status_summary(
             "{name:<12}  count={count_cell}  time={}",
             fmt_duration_in_unit(duration, timing_unit)
         )
+    };
+    let optional_timing_row = |name: &str, count: Option<Index>, duration: Option<Duration>| {
+        let count_cell = match count {
+            Some(count) => format!("{count:>4}"),
+            None => format!("{:>4}", "--"),
+        };
+        let time_cell = duration
+            .map(|duration| fmt_duration_in_unit(duration, timing_unit))
+            .unwrap_or_else(|| format!("{:>7}", "--"));
+        format!("{name:<12}  count={count_cell}  time={time_cell}")
     };
     let lines = vec![
         boxed_line(
@@ -1321,6 +1400,39 @@ fn log_interior_point_status_summary(
         ),
         boxed_line(
             "",
+            optional_timing_row(
+                "adapter cb",
+                None,
+                summary
+                    .profiling
+                    .adapter_timing
+                    .map(|timing| timing.callback_evaluation),
+            ),
+        ),
+        boxed_line(
+            "",
+            optional_timing_row(
+                "adapter io",
+                None,
+                summary
+                    .profiling
+                    .adapter_timing
+                    .map(|timing| timing.output_marshalling),
+            ),
+        ),
+        boxed_line(
+            "",
+            optional_timing_row(
+                "layout",
+                None,
+                summary
+                    .profiling
+                    .adapter_timing
+                    .map(|timing| timing.layout_projection),
+            ),
+        ),
+        boxed_line(
+            "",
             timing_row("preprocess", None, summary.profiling.preprocessing_time),
         ),
         boxed_line(
@@ -1416,6 +1528,8 @@ where
     let mut z = vec![1.0; augmented_inequality_count];
     let mut slack = vec![1.0; augmented_inequality_count];
     let mut event_state = SqpEventLegendState::default();
+    let mut last_adapter_timing = problem.adapter_timing_snapshot();
+    profiling.adapter_timing = last_adapter_timing;
 
     let setup_started = Instant::now();
     let mut setup_callback_time = Duration::ZERO;
@@ -1504,6 +1618,12 @@ where
             && dual_inf <= options.dual_tol
             && complementarity_inf <= options.complementarity_tol
         {
+            let adapter_timing = adapter_timing_delta(problem, &mut last_adapter_timing);
+            profiling.adapter_timing = last_adapter_timing;
+            let iteration_total = iteration_started.elapsed();
+            let iteration_preprocess = iteration_total.saturating_sub(
+                iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,
+            );
             let snapshot = InteriorPointIterationSnapshot {
                 iteration,
                 phase: InteriorPointIterationPhase::Converged,
@@ -1518,6 +1638,14 @@ where
                 line_search_iterations: None,
                 linear_solver: last_linear_solver,
                 linear_solve_time: None,
+                timing: InteriorPointIterationTiming {
+                    adapter_timing,
+                    callback: iteration_callback_time,
+                    kkt_assembly: iteration_kkt_assembly_time,
+                    linear_solve: iteration_linear_solve_time,
+                    preprocess: iteration_preprocess,
+                    total: iteration_total,
+                },
                 events: Vec::new(),
             };
             callback(&snapshot);
@@ -1987,6 +2115,12 @@ where
         if iteration + 1 == options.max_iters {
             events.push(InteriorPointIterationEvent::MaxIterationsReached);
         }
+        let adapter_timing = adapter_timing_delta(problem, &mut last_adapter_timing);
+        profiling.adapter_timing = last_adapter_timing;
+        let iteration_total = iteration_started.elapsed();
+        let iteration_preprocess = iteration_total.saturating_sub(
+            iteration_callback_time + iteration_kkt_assembly_time + iteration_linear_solve_time,
+        );
         callback(&InteriorPointIterationSnapshot {
             iteration,
             phase: InteriorPointIterationPhase::AcceptedStep,
@@ -2001,6 +2135,14 @@ where
             line_search_iterations: Some(line_search_iterations),
             linear_solver: direction.solver_used,
             linear_solve_time: Some(iteration_linear_solve_time),
+            timing: InteriorPointIterationTiming {
+                adapter_timing,
+                callback: iteration_callback_time,
+                kkt_assembly: iteration_kkt_assembly_time,
+                linear_solve: iteration_linear_solve_time,
+                preprocess: iteration_preprocess,
+                total: iteration_total,
+            },
             events,
         });
 

@@ -1105,6 +1105,8 @@ dependencies = [
  "nalgebra",
  "optimization_derive",
  "rstest",
+ "serde",
+ "serde_json",
  "sx_codegen_llvm",
  "sx_core",
  "thiserror 2.0.18",

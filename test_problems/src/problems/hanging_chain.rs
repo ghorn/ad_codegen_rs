@@ -217,43 +217,45 @@ fn case_for<const N: usize, const LINKS: usize>(
             },
             move |record| validate_hanging_chain::<N, LINKS>(record, constraint_mode),
         ),
-        ConstraintMode::Inequality => make_typed_case::<Chain<SX, N>, (), (), VecN<SX, LINKS>, _, _>(
-            metadata,
-            move |jit_opt_level| {
-                let spec = HangingChainSpec::for_links(LINKS);
-                let compiled = symbolic_compile::<Chain<SX, N>, (), (), VecN<SX, LINKS>, _>(
-                    id,
-                    |q, ()| {
-                        let objective = hanging_chain_objective(q);
-                        let constraints = hanging_chain_constraints::<N, LINKS>(q, spec);
-                        SymbolicNlpOutputs {
-                            objective,
-                            equalities: (),
-                            inequalities: constraints,
-                        }
-                    },
-                    jit_opt_level,
-                )?;
-                Ok(super::TypedProblemData {
-                    compiled,
-                    x0: initial_guess::<N, LINKS>(spec, initial_condition),
-                    parameters: (),
-                    bounds: TypedRuntimeNlpBounds {
-                        variable_lower: None,
-                        variable_upper: None,
-                        inequality_lower: Some(
-                            <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(
-                                &mut || f64::NEG_INFINITY,
+        ConstraintMode::Inequality => {
+            make_typed_case::<Chain<SX, N>, (), (), VecN<SX, LINKS>, _, _>(
+                metadata,
+                move |jit_opt_level| {
+                    let spec = HangingChainSpec::for_links(LINKS);
+                    let compiled = symbolic_compile::<Chain<SX, N>, (), (), VecN<SX, LINKS>, _>(
+                        id,
+                        |q, ()| {
+                            let objective = hanging_chain_objective(q);
+                            let constraints = hanging_chain_constraints::<N, LINKS>(q, spec);
+                            SymbolicNlpOutputs {
+                                objective,
+                                equalities: (),
+                                inequalities: constraints,
+                            }
+                        },
+                        jit_opt_level,
+                    )?;
+                    Ok(super::TypedProblemData {
+                        compiled,
+                        x0: initial_guess::<N, LINKS>(spec, initial_condition),
+                        parameters: (),
+                        bounds: TypedRuntimeNlpBounds {
+                            variable_lower: None,
+                            variable_upper: None,
+                            inequality_lower: Some(
+                                <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || {
+                                    f64::NEG_INFINITY
+                                }),
                             ),
-                        ),
-                        inequality_upper: Some(
-                            <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || 0.0),
-                        ),
-                    },
-                })
-            },
-            move |record| validate_hanging_chain::<N, LINKS>(record, constraint_mode),
-        ),
+                            inequality_upper: Some(
+                                <VecN<SX, LINKS> as Vectorize<SX>>::from_flat_fn(&mut || 0.0),
+                            ),
+                        },
+                    })
+                },
+                move |record| validate_hanging_chain::<N, LINKS>(record, constraint_mode),
+            )
+        }
     }
 }
 
